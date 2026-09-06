@@ -1,49 +1,60 @@
 /**
- * MAXSER – Portal Access Core (Revision 2 – produktionsgeprüft)
- * ================================================================
- * Einziger Code-Node im Sub-Workflow "MAXSER – Portal Access Core".
- * Wird per "Execute Workflow" aus dem Hauptworkflow aufgerufen.
+ * MAXSER – Portal Access Core (Revision 3 – ohne $helpers, reine Klassifizierung)
+ * ==================================================================================
+ * WICHTIG: Dieser Node macht KEINE eigenen HTTP-Requests mehr und ruft
+ * NICHT $helpers.httpRequest / $helpers.prepareBinaryData auf (diese APIs
+ * sind je nach n8n-Version/Instanz nicht sicher verfügbar). Er läuft
+ * IMMER DIREKT NACH einem normalen "HTTP Request"-Node im selben
+ * Workflow und klassifiziert nur dessen Ergebnis. Alle Netzwerk-Calls
+ * übernehmen echte HTTP-Request-Nodes.
  *
  * Node-Modus: "Run Once for All Items"
- * Sub-Workflow-Aufbau: [Execute Workflow Trigger] -> [dieser Code-Node] -> [NoOp]
  *
- * VORAUSSETZUNG (bitte vor Produktivbetrieb einmal verifizieren):
- * n8n-Version mit `$helpers.httpRequest` / `$helpers.prepareBinaryData`
- * im Code-Node (n8n ≥ ~1.19, self-hosted oder Cloud). Prüfen:
- * in einem leeren Code-Node `return [{json:{ok: typeof $helpers}}]`
- * ausführen – muss "object" liefern, nicht "undefined".
+ * Erwartete Eingabe je Item (kommt vom vorgeschalteten HTTP Request Node):
+ *   - $json.statusCode        (Number – HTTP Request Node: "Full Response"/
+ *                               "Include Response Headers and Status" AN)
+ *   - $json.headers           (Object)
+ *   - $json.requestUrl        (String – die tatsächlich angefragte URL;
+ *                               VOR dem HTTP Request Node selbst setzen,
+ *                               z.B. per Set-Node aus firstDocumentUrl)
+ *   - $json.procurementPortal (String)
+ *   - $json.sessionCookiesHeader (String, optional – von einem vorherigen Durchlauf)
+ *   - $json.retryCount        (Number, optional, Default 0)
+ *   - $json.docIndex          (Number, optional – nur bei Einzel-Dokument-
+ *                               Downloads im "isDocumentSubFetch"-Zweig)
+ *   - $json.isDocumentSubFetch (Boolean, optional – true = dies ist der
+ *                               Download EINES bereits bekannten Dokument-
+ *                               Links, nicht die erste Sondierung der Seite)
+ *   - $json.error             (String, optional – von der "error output"-
+ *                               Verzweigung des HTTP Request Node bei
+ *                               echten Netzwerkfehlern/Timeouts)
+ *   - item.binary.data        (die vom HTTP Request Node geladene Antwort,
+ *                               Response Format "File")
  *
- * Erwartete Eingabe je Item (json):
- *   - procurementPortal   (z.B. "MUENCHEN_VERGABE", "TED", "ANDERES_PORTAL", ...)
- *   - firstDocumentUrl    (String, URL)
- *   - documentUrls        (Array<String>, optional – weitere bekannte Links)
- *   - tedNumber / noticeNumber / id (irgendein Ausschreibungs-Identifier, für Logging)
- *
- * Erzeugte Ausgabe je Item (json), zusätzlich zu allen Eingabefeldern:
+ * Erzeugte Ausgabe je Item (json):
  *   portalAccessStatus, portalAccessReason, sourceUrl, finalUrl, httpStatus,
  *   contentType, isDirectFile, isHtmlPage, authRequired, sessionRequired,
- *   browserRequired, rateLimited, documentsFound, documentsDownloaded,
- *   documentNames, documentUrls, documentMimeTypes, downloadSucceeded,
- *   manualReviewRequired, loginRequired, portalAdapterUsed,
- *   latestVersionDetected, processingErrors, sessionCookies
- * Binärdaten: item.binary.doc_0, doc_1, ...
+ *   browserRequired, rateLimited, documentsFound, documentUrls,
+ *   documentNames, documentMimeTypes, manualReviewRequired, loginRequired,
+ *   portalAdapterUsed, latestVersionDetected, processingErrors,
+ *   sessionCookiesHeader, needsRetry, retryCount, backoffMs
+ * Binärdaten: bei DIRECT_FILE / isDocumentSubFetch wird das vorhandene
+ * item.binary.data 1:1 nach item.binary.doc_<docIndex> umbenannt
+ * (KEIN prepareBinaryData nötig – reine Objekt-Zuweisung).
  *
- * Dieser Node setzt NIEMALS documentAccessStatus (das macht ausschließlich
- * der separate "Dokument-Normalisierung & Pre-AI-Gate"-Node danach). Er
- * liefert dafür aber die Rohdaten (documentsFound/documentsDownloaded/
- * downloadSucceeded/binary), auf denen dieses Gate aufbaut – siehe R/S/T
- * in docs/architecture.md.
+ * documentsDownloaded / downloadSucceeded / documentAccessStatus werden
+ * HIER NICHT final gesetzt – das erfolgt erst im nachgelagerten
+ * Aggregations-/Gate-Node, der die Einzel-Downloads mehrerer Dokumente
+ * (mehrere Durchläufe dieses Nodes) wieder zu einem Ausschreibungs-Item
+ * zusammenführt.
  */
 
 // =====================================================================
-// 0. SICHERHEITS-/RESSOURCEN-LIMITS
+// 0. LIMITS
 // =====================================================================
-const MAX_RETRIES = 3; // + 1 Erstversuch = max. 4 Requests pro URL
-const MAX_REDIRECTS = 8;
-const MAX_DOWNLOAD_BYTES = 60 * 1024 * 1024; // 60 MB – realistische Obergrenze für Vergabeunterlagen
-const INLINE_RETRY_MAX_WAIT_MS = 15000; // längere Wartezeiten NICHT im Code-Node blockieren (siehe G)
-const REQUEST_TIMEOUT_MS = 30000;
-const MIN_PLAUSIBLE_FILE_BYTES = 16; // 0-Byte-/Trunkierte Antworten nicht als Datei durchwinken
+const MIN_PLAUSIBLE_FILE_BYTES = 16; // 0-Byte-/abgeschnittene Antworten nie als Datei durchwinken
+const MAX_RETRY_COUNT = 3;
+const INLINE_RETRY_MAX_WAIT_MS = 15000; // > 15s Wartezeit -> nicht mehr automatisch retryen, sondern RATE_LIMITED melden
 
 // =====================================================================
 // 1. ZENTRALE PORTAL-KONFIGURATION (Teil O)
@@ -52,31 +63,28 @@ const MIN_PLAUSIBLE_FILE_BYTES = 16; // 0-Byte-/Trunkierte Antworten nicht als D
 // HTTP-Antwort. Die Flags hier sind nur ein Beschleuniger/Cache für
 // bereits real getestete Portale (siehe docs/architecture.md, Abschnitt O).
 const PORTAL_CONFIG = {
-  EVERGABE: { domain: null, verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  EVERGABE_ONLINE: { domain: "evergabe-online.de", verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  DEUTSCHE_EVERGABE: { domain: "deutsche-evergabe.de", verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  BERLIN_VERGABE: { domain: "vergabe.berlin.de", verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  BRANDENBURG_VERGABE: { domain: "vergabemarktplatz.brandenburg.de", verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  SACHSEN_ANHALT_VERGABE: { domain: "evergabe.sachsen-anhalt.de", verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  SACHSEN_VERGABE: { domain: "evergabe.sachsen.de", verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  MV_LAND_VERGABE: { domain: null, verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  MV_EVERGABE: { domain: null, verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  BAYERN_VERGABE: { domain: "vergabe.bayern.de", verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  MUENCHEN_VERGABE: { domain: "vergabe.muenchen.de", verified: true, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "OID_TOKEN", loginStrategy: null, parserName: "vergabeMuenchen" },
-  BADEN_WUERTTEMBERG_VERGABE: { domain: null, verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  DTVP: { domain: "dtvp.de", verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  VMP_RHEINLAND: { domain: null, verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  SUBREPORT: { domain: "subreport.de", verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  BREMEN_VERGABE: { domain: "vergabe.bremen.de", verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  METROPOLE_RUHR: { domain: "vergabe.metropoleruhr.de", verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  AUMASS: { domain: null, verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  HAD_HESSEN: { domain: "had.de", verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  TED: { domain: "ted.europa.eu", verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
-  ANDERES_PORTAL: { domain: null, verified: false, requiresAuth: false, requiresBrowser: false, supportsPublicDownload: true, downloadStrategy: "AUTO", loginStrategy: null, parserName: "genericHtml" },
+  EVERGABE: { domain: null, verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  EVERGABE_ONLINE: { domain: "evergabe-online.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  DEUTSCHE_EVERGABE: { domain: "deutsche-evergabe.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  BERLIN_VERGABE: { domain: "vergabe.berlin.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  BRANDENBURG_VERGABE: { domain: "vergabemarktplatz.brandenburg.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  SACHSEN_ANHALT_VERGABE: { domain: "evergabe.sachsen-anhalt.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  SACHSEN_VERGABE: { domain: "evergabe.sachsen.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  MV_LAND_VERGABE: { domain: null, verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  MV_EVERGABE: { domain: null, verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  BAYERN_VERGABE: { domain: "vergabe.bayern.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  MUENCHEN_VERGABE: { domain: "vergabe.muenchen.de", verified: true, requiresBrowser: false, parserName: "vergabeMuenchen" },
+  BADEN_WUERTTEMBERG_VERGABE: { domain: null, verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  DTVP: { domain: "dtvp.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  VMP_RHEINLAND: { domain: null, verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  SUBREPORT: { domain: "subreport.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  BREMEN_VERGABE: { domain: "vergabe.bremen.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  METROPOLE_RUHR: { domain: "vergabe.metropoleruhr.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  AUMASS: { domain: null, verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  HAD_HESSEN: { domain: "had.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  TED: { domain: "ted.europa.eu", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  ANDERES_PORTAL: { domain: null, verified: false, requiresBrowser: false, parserName: "genericHtml" },
 };
-// Hinweis: Nicht als "domain" markierte bzw. verified:false Einträge sind
-// unbestätigte Best-Guess-Domains. Vor Produktivbetrieb je Portal einmal
-// real testen und dann verified:true + passende downloadStrategy setzen.
 
 function getPortalConfig(procurementPortal, url) {
   const cfg = PORTAL_CONFIG[procurementPortal] || PORTAL_CONFIG.ANDERES_PORTAL;
@@ -96,8 +104,6 @@ function resolveUrl(maybeRelativeUrl, baseUrl) {
   const trimmed = String(maybeRelativeUrl).trim();
   if (!trimmed || /^(javascript|mailto|tel):/i.test(trimmed) || trimmed.startsWith("#")) return null;
   try {
-    // new URL() löst protokollrelative ("//host/..."), absolute und
-    // relative ("../x", "x/y.pdf") Pfade gegen baseUrl korrekt auf.
     const resolved = new URL(trimmed, baseUrl);
     if (resolved.protocol !== "http:" && resolved.protocol !== "https:") return null;
     return resolved.toString();
@@ -118,14 +124,12 @@ function absolutizeAll(urls, baseUrl) {
 
 // =====================================================================
 // 3. TEXT-DEKODIERUNG (deutsche Portale liefern oft ISO-8859-1/CP-1252
-//    statt UTF-8 – wichtig für die HTML-Sniffing-/Adapter-Logik)
+//    statt UTF-8 – wichtig für HTML-Sniffing/Adapter). Reine JS-Funktionen,
+//    kein n8n-spezifisches API nötig.
 // =====================================================================
 function detectDeclaredCharset(contentTypeHeader, buffer) {
   const ctMatch = (contentTypeHeader || "").match(/charset\s*=\s*"?([\w-]+)"?/i);
   if (ctMatch) return ctMatch[1].toLowerCase();
-  // <meta charset> / <meta http-equiv content=".."> nur in den ersten Bytes suchen,
-  // dabei als latin1 lesen, damit ASCII-Marker unabhängig von der echten
-  // Kodierung sicher erkannt werden.
   const head = buffer.slice(0, 1024).toString("latin1");
   const metaCharset = head.match(/<meta[^>]+charset=["']?([\w-]+)/i);
   if (metaCharset) return metaCharset[1].toLowerCase();
@@ -134,9 +138,6 @@ function detectDeclaredCharset(contentTypeHeader, buffer) {
 
 function decodeBody(buffer, contentTypeHeader) {
   const declared = detectDeclaredCharset(contentTypeHeader, buffer);
-  // Node kennt "latin1" nativ als Alias für ISO-8859-1. Das ist für
-  // Windows-1252 nicht byte-exakt (Bereich 0x80-0x9F unterscheidet sich),
-  // reicht aber für Muster-/Keyword-Erkennung in diesem Node aus.
   if (declared && /iso-8859-1|latin1|windows-1252|cp1252/i.test(declared)) {
     return buffer.toString("latin1");
   }
@@ -153,31 +154,25 @@ const MAGIC_SIGNATURES = [
       (b[0] === 0x50 && b[1] === 0x4b && b[2] === 0x05 && b[3] === 0x06) ||
       (b[0] === 0x50 && b[1] === 0x4b && b[2] === 0x07 && b[3] === 0x08)
     ) },
-  // Legacy .doc/.xls (OLE Compound File Binary Format) – gemeinsame Signatur,
-  // Sub-Typ NUR über Extension/Content-Type unterscheidbar (siehe unten).
+  // Legacy .doc/.xls (OLE Compound File Binary Format) – Sub-Typ NUR über
+  // Extension/Content-Type unterscheidbar, Magic Bytes sind identisch.
   { type: "OLE_COMPOUND", check: (b) => b.length >= 8 &&
       b[0] === 0xd0 && b[1] === 0xcf && b[2] === 0x11 && b[3] === 0xe0 &&
       b[4] === 0xa1 && b[5] === 0xb1 && b[6] === 0x1a && b[7] === 0xe1 },
 ];
 
 const EXTENSION_MIME_MAP = {
-  pdf: "application/pdf",
-  zip: "application/zip",
+  pdf: "application/pdf", zip: "application/zip",
   docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  doc: "application/msword",
-  xls: "application/vnd.ms-excel",
-  csv: "text/csv",
-  xml: "application/xml",
-  html: "text/html",
-  htm: "text/html",
+  doc: "application/msword", xls: "application/vnd.ms-excel",
+  csv: "text/csv", xml: "application/xml", html: "text/html", htm: "text/html",
 };
 
 function sniffTextKind(buffer, contentTypeHeader) {
   const sample = decodeBody(buffer.slice(0, 2048), contentTypeHeader).trim();
   if (/^<\?xml/i.test(sample)) return "XML";
   if (/^<!doctype html/i.test(sample) || /<html[\s>]/i.test(sample.slice(0, 500))) return "HTML";
-  // sehr einfache CSV-Heuristik: mind. 2 Zeilen mit übereinstimmender Trennzeichen-Anzahl
   const lines = sample.split(/\r?\n/).filter(Boolean).slice(0, 5);
   if (lines.length >= 2) {
     const counts = lines.map((l) => (l.match(/[;,]/g) || []).length);
@@ -214,8 +209,6 @@ function detectFileType({ buffer, contentTypeHeader, url, contentDisposition }) 
   const extFromCd = filenameFromCd ? (filenameFromCd.match(/\.([a-zA-Z0-9]{2,5})$/) || [])[1] : null;
   const declaredExt = (extFromCd || extFromUrl || "").toLowerCase();
 
-  // Leere oder verdächtig kleine Antworten nie als echte Datei durchwinken,
-  // selbst wenn der Content-Type-Header etwas anderes behauptet.
   if (!buffer || buffer.length < MIN_PLAUSIBLE_FILE_BYTES) {
     return { kind: "UNKNOWN", mime: ctHeader || null, ext: declaredExt || null, isFile: false, source: "none", reason: `EMPTY_OR_TOO_SMALL_BODY:${buffer ? buffer.length : 0}bytes` };
   }
@@ -224,16 +217,12 @@ function detectFileType({ buffer, contentTypeHeader, url, contentDisposition }) 
   for (const sig of MAGIC_SIGNATURES) {
     if (sig.check(buffer)) { magicType = sig.type; break; }
   }
-  if (!magicType) {
-    magicType = sniffTextKind(buffer, contentTypeHeader);
-  }
+  if (!magicType) magicType = sniffTextKind(buffer, contentTypeHeader);
 
-  // Fall 1: Magic Bytes sagen eindeutig PDF -> vertrauen, unabhängig vom Header.
   if (magicType === "PDF") {
     return { kind: "PDF", mime: "application/pdf", ext: "pdf", isFile: true, source: "magic" };
   }
 
-  // Fall 2: ZIP-Familie per Magic Bytes bestätigt -> Feinunterscheidung über Header/Extension.
   if (magicType === "ZIP_FAMILY") {
     if (declaredExt === "docx" || ctHeader.includes("wordprocessingml")) {
       return { kind: "DOCX", mime: EXTENSION_MIME_MAP.docx, ext: "docx", isFile: true, source: "magic+header" };
@@ -244,8 +233,6 @@ function detectFileType({ buffer, contentTypeHeader, url, contentDisposition }) 
     return { kind: "ZIP", mime: "application/zip", ext: "zip", isFile: true, source: "magic" };
   }
 
-  // Fall 3: Legacy OLE-Container (.doc/.xls) -> Feinunterscheidung nur über
-  // Extension/Content-Type möglich (Magic Bytes sind für beide identisch).
   if (magicType === "OLE_COMPOUND") {
     if (declaredExt === "xls" || ctHeader === "application/vnd.ms-excel") {
       return { kind: "XLS", mime: EXTENSION_MIME_MAP.xls, ext: "xls", isFile: true, source: "magic+header" };
@@ -253,17 +240,13 @@ function detectFileType({ buffer, contentTypeHeader, url, contentDisposition }) 
     if (declaredExt === "doc" || ctHeader === "application/msword") {
       return { kind: "DOC", mime: EXTENSION_MIME_MAP.doc, ext: "doc", isFile: true, source: "magic+header" };
     }
-    // Sub-Typ unklar, aber es ist zweifelsfrei ein echtes Office-Binärdokument
-    // -> als Datei behandeln (nicht MANUAL_REVIEW), nur der genaue Typ bleibt offen.
     return { kind: "OLE_DOCUMENT", mime: "application/octet-stream", ext: declaredExt || "doc", isFile: true, source: "magic-ambiguous-subtype" };
   }
 
-  // Fall 4: Text-artige Formate per Sniff (XML/HTML/CSV).
   if (magicType === "XML" || magicType === "HTML" || magicType === "CSV") {
     return { kind: magicType, mime: EXTENSION_MIME_MAP[magicType.toLowerCase()] || null, ext: magicType.toLowerCase(), isFile: magicType !== "HTML", source: "sniff" };
   }
 
-  // Fall 5: Kein Sniff-Treffer -> auf Content-Type-Header zurückfallen, wenn eindeutig.
   if (ctHeader === "application/pdf") return { kind: "PDF", mime: ctHeader, ext: "pdf", isFile: true, source: "header" };
   if (ctHeader === "application/zip" || ctHeader === "application/x-zip-compressed") return { kind: "ZIP", mime: ctHeader, ext: "zip", isFile: true, source: "header" };
   if (ctHeader.includes("wordprocessingml")) return { kind: "DOCX", mime: ctHeader, ext: "docx", isFile: true, source: "header" };
@@ -274,12 +257,11 @@ function detectFileType({ buffer, contentTypeHeader, url, contentDisposition }) 
   if (ctHeader === "application/xml" || ctHeader === "text/xml") return { kind: "XML", mime: ctHeader, ext: "xml", isFile: true, source: "header" };
   if (ctHeader === "text/html") return { kind: "HTML", mime: ctHeader, ext: "html", isFile: false, source: "header" };
 
-  // Fall 6: gar nichts Eindeutiges -> nicht raten.
   return { kind: "UNKNOWN", mime: ctHeader || null, ext: declaredExt || null, isFile: false, source: "none", reason: `UNKNOWN_CONTENT_TYPE:${ctHeader || "n/a"}` };
 }
 
 // =====================================================================
-// 5. COOKIE-JAR / SESSION-PERSISTENZ (Teil H)
+// 5. COOKIES (Teil H) – reines String-/Objekt-Parsing, kein Netzwerk
 // =====================================================================
 function parseSetCookies(headers) {
   const raw = headers && (headers["set-cookie"] || headers["Set-Cookie"]);
@@ -294,15 +276,24 @@ function parseSetCookies(headers) {
   return jar;
 }
 
-function mergeCookies(existing, fresh) {
-  return { ...(existing || {}), ...(fresh || {}) };
+function parseCookieHeader(headerStr) {
+  const jar = {};
+  if (!headerStr) return jar;
+  for (const pair of headerStr.split(";")) {
+    const idx = pair.indexOf("=");
+    if (idx > 0) jar[pair.slice(0, idx).trim()] = pair.slice(idx + 1).trim();
+  }
+  return jar;
 }
 
 function cookiesToHeader(jar) {
-  if (!jar || !Object.keys(jar).length) return undefined;
+  if (!jar || !Object.keys(jar).length) return "";
   return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join("; ");
 }
 
+// Cross-Execution-Wiederverwendung (Teil H). $getWorkflowStaticData ist ein
+// eigenständiges, seit Langem stabiles Code-Node-Feature (unabhängig von
+// $helpers) und in jeder n8n-Version verfügbar.
 function loadPersistedSession(staticData, domain) {
   const store = staticData.sessions || {};
   const entry = store[domain];
@@ -316,13 +307,12 @@ function persistSession(staticData, domain, cookies, ttlMs = 25 * 60 * 1000) {
 }
 
 // =====================================================================
-// 6. HTTP-KERN: manueller Redirect-Walk (damit Cookies aus Zwischen-Hops
-//    NICHT verloren gehen) + Retry/Backoff + Fehlerhandler (Teile F, G, H)
+// 6. FEHLERHANDLER (Teil F) – reine Zuordnung, KEIN Sleep/Retry hier.
+// Retry/Backoff läuft als echte Graph-Schleife: dieser Node liefert nur
+// `needsRetry` + `backoffMs`, die IF/Wait-Nodes im Hauptworkflow werten
+// das aus (siehe Antwort-Text, Punkt 6 / docs/architecture.md Abschnitt G).
 // =====================================================================
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
-const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
-
-function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 function parseRetryAfter(headers) {
   const val = headers && (headers["retry-after"] || headers["Retry-After"]);
@@ -334,150 +324,21 @@ function parseRetryAfter(headers) {
   return null;
 }
 
-/**
- * Führt EINEN logischen "Seitenbesuch" aus: folgt 3xx-Redirects manuell
- * (statt der eingebauten Auto-Redirect-Funktion), damit Set-Cookie-Header
- * aus Zwischen-Hops nicht verloren gehen (n8n/axios würde sie sonst
- * stillschweigend verwerfen). Wirft NICHT bei HTTP-Fehlerstatus.
- *
- * WICHTIG: `disableFollowRedirect` ist das dokumentierte n8n-Feld, um das
- * automatische Redirect-Following von $helpers.httpRequest abzuschalten.
- * Ohne diese manuelle Schleife würde n8n selbst folgen, aber die dabei
- * gesetzten Cookies wären für uns unsichtbar.
- */
-async function followRedirectsManually(helpers, { startUrl, cookieJar }) {
-  let currentUrl = startUrl;
-  let jar = { ...(cookieJar || {}) };
-  let hops = 0;
-
-  while (true) {
-    let response;
-    try {
-      response = await helpers.httpRequest({
-        url: currentUrl,
-        method: "GET",
-        headers: cookiesToHeader(jar) ? { Cookie: cookiesToHeader(jar) } : {},
-        encoding: "arraybuffer",
-        returnFullResponse: true,
-        ignoreHttpStatusErrors: true,
-        disableFollowRedirect: true,
-        timeout: REQUEST_TIMEOUT_MS,
-      });
-    } catch (err) {
-      // Manche n8n-Versionen werfen trotz ignoreHttpStatusErrors bei echten
-      // Netzwerkfehlern; manche legen die reale Response unter err.response ab.
-      if (err && err.response && (err.response.statusCode || err.response.status)) {
-        response = err.response;
-      } else {
-        return { status: null, headers: {}, body: Buffer.alloc(0), finalUrl: currentUrl, cookieJar: jar, error: err.message || String(err) };
-      }
-    }
-
-    const status = response.statusCode ?? response.status ?? null;
-    const headers = response.headers || {};
-    const fresh = parseSetCookies(headers);
-    if (Object.keys(fresh).length) jar = mergeCookies(jar, fresh);
-
-    if (status == null) {
-      return { status: null, headers, body: Buffer.alloc(0), finalUrl: currentUrl, cookieJar: jar, error: "NO_STATUS_CODE_IN_RESPONSE" };
-    }
-
-    if (REDIRECT_STATUS.has(status)) {
-      const location = headers.location || headers.Location;
-      const nextUrl = resolveUrl(location, currentUrl);
-      hops += 1;
-      if (!nextUrl || hops > MAX_REDIRECTS) {
-        return { status, headers, body: Buffer.alloc(0), finalUrl: currentUrl, cookieJar: jar, error: nextUrl ? "TOO_MANY_REDIRECTS" : "REDIRECT_WITHOUT_LOCATION" };
-      }
-      currentUrl = nextUrl;
-      continue; // wir nutzen ausschließlich GET, daher kein Methodenwechsel nötig
-    }
-
-    let bodyRaw = response.body;
-    const body = Buffer.isBuffer(bodyRaw) ? bodyRaw : Buffer.from(bodyRaw || new Uint8Array());
-
-    if (body.length > MAX_DOWNLOAD_BYTES) {
-      return { status, headers, body: Buffer.alloc(0), finalUrl: currentUrl, cookieJar: jar, error: `FILE_TOO_LARGE:${body.length}bytes` };
-    }
-
-    return { status, headers, body, finalUrl: currentUrl, cookieJar: jar, error: null };
-  }
-}
-
-/**
- * Wrappt followRedirectsManually mit Retry/Backoff für 408/429/5xx.
- * Kurze, transiente Fehler werden IM Code-Node mit kurzem Backoff erneut
- * versucht. Ist die nötige Wartezeit lang (z.B. Retry-After > 15s), wird
- * NICHT im Node geschlafen (Blockiert sonst den Worker-Slot und riskiert
- * das n8n Execution-Timeout) – stattdessen wird der Status unverändert
- * als RATE_LIMITED zurückgegeben, damit der Hauptworkflow einen echten
- * "Wait"-Node verwenden kann (siehe docs/architecture.md, Abschnitt G).
- */
-async function robustRequest(helpers, { url, cookieHeader }) {
-  const initialJar = {};
-  if (cookieHeader) {
-    for (const pair of cookieHeader.split(";")) {
-      const idx = pair.indexOf("=");
-      if (idx > 0) initialJar[pair.slice(0, idx).trim()] = pair.slice(idx + 1).trim();
-    }
-  }
-
-  let jar = initialJar;
-  let lastResult = null;
-
-  for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
-    const result = await followRedirectsManually(helpers, { startUrl: url, cookieJar: jar });
-    jar = result.cookieJar;
-    lastResult = result;
-
-    const isLastAttempt = attempt === MAX_RETRIES + 1;
-    if (isLastAttempt) return lastResult;
-
-    if (result.status == null) {
-      // Netzwerkfehler: kurzer Backoff, dann erneut.
-      await sleep(Math.min(1500 * 2 ** (attempt - 1), 8000));
-      continue;
-    }
-
-    if (RETRYABLE_STATUS.has(result.status)) {
-      if (result.status === 429) {
-        const retryAfterMs = parseRetryAfter(result.headers);
-        if (retryAfterMs != null && retryAfterMs > INLINE_RETRY_MAX_WAIT_MS) {
-          return lastResult; // lange Wartezeit -> an den Aufrufer/Graph-Ebene delegieren
-        }
-        await sleep(retryAfterMs != null ? retryAfterMs : Math.min(2000 * 2 ** (attempt - 1), 8000));
-        continue;
-      }
-      await sleep(Math.min(2000 * 2 ** (attempt - 1), 8000));
-      continue;
-    }
-
-    return lastResult; // kein retryable Status -> sofort zurückgeben
-  }
-  return lastResult;
-}
-
-/**
- * Übersetzt einen HTTP-Status in (status, reason) für portalAccessStatus.
- * Deckt explizit 401,403,404,408,429,500,502,503,504 ab (Teil F).
- */
 function classifyHttpError(status, headers) {
   switch (status) {
-    case 401: return { portalAccessStatus: "AUTH_REQUIRED", portalAccessReason: "HTTP_401_UNAUTHORIZED" };
-    case 403: return { portalAccessStatus: "BLOCKED", portalAccessReason: "HTTP_403_FORBIDDEN" };
-    case 404: return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: "HTTP_404_NOT_FOUND" };
-    case 408: return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: "HTTP_408_TIMEOUT_AFTER_RETRIES" };
-    case 429: return { portalAccessStatus: "RATE_LIMITED", portalAccessReason: `HTTP_429_RATE_LIMITED:${parseRetryAfter(headers) || "n/a"}` };
-    case 500: return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: "HTTP_500_SERVER_ERROR_AFTER_RETRIES" };
-    case 502: return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: "HTTP_502_BAD_GATEWAY_AFTER_RETRIES" };
-    case 503: return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: "HTTP_503_UNAVAILABLE_AFTER_RETRIES" };
-    case 504: return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: "HTTP_504_GATEWAY_TIMEOUT_AFTER_RETRIES" };
+    case 401: return { portalAccessStatus: "AUTH_REQUIRED", portalAccessReason: "HTTP_401_UNAUTHORIZED", retryable: false };
+    case 403: return { portalAccessStatus: "BLOCKED", portalAccessReason: "HTTP_403_FORBIDDEN", retryable: false };
+    case 404: return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: "HTTP_404_NOT_FOUND", retryable: false };
+    case 408: return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: "HTTP_408_TIMEOUT", retryable: true };
+    case 429: return { portalAccessStatus: "RATE_LIMITED", portalAccessReason: `HTTP_429_RATE_LIMITED:${parseRetryAfter(headers) || "n/a"}`, retryable: true };
+    case 500: return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: "HTTP_500_SERVER_ERROR", retryable: true };
+    case 502: return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: "HTTP_502_BAD_GATEWAY", retryable: true };
+    case 503: return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: "HTTP_503_UNAVAILABLE", retryable: true };
+    case 504: return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: "HTTP_504_GATEWAY_TIMEOUT", retryable: true };
     default: return null;
   }
 }
 
-// Sehr einfache, konservative Bot-/Challenge-Erkennung. Erkennt NUR
-// offensichtliche Marker, um zu melden – niemals um sie zu umgehen.
 function looksLikeBotChallenge(bodyText) {
   const t = (bodyText || "").toLowerCase();
   return (
@@ -503,11 +364,11 @@ function looksLikeSpaShell(bodyText) {
 // =====================================================================
 // 7. PORTAL-ADAPTER (Teil C – Router) + Beispiel-Adapter (L, M, N)
 // =====================================================================
+const DOC_EXT_RE = /\.(pdf|zip|docx?|xlsx?|csv|xml)(\?[^"'>\s]*)?$/i;
 
 // M) Klassischer HTML-Adapter mit normalen <a href> Downloadlinks.
 // Dient auch als Fallback ("genericHtml") für alle noch nicht
 // spezifisch implementierten Portale.
-const DOC_EXT_RE = /\.(pdf|zip|docx?|xlsx?|csv|xml)(\?[^"'>\s]*)?$/i;
 function genericHtmlAdapter(html, baseUrl) {
   const links = [];
   const aTagRe = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
@@ -519,7 +380,6 @@ function genericHtmlAdapter(html, baseUrl) {
       links.push(href);
     }
   }
-  // Zusätzlich data-* Attribute mit Datei-Endungen erfassen (z.B. data-href, data-download-url).
   const dataAttrRe = /data-(?:href|download-url|file-url|url)=["']([^"']+)["']/gi;
   while ((m = dataAttrRe.exec(html)) !== null) {
     if (DOC_EXT_RE.test(m[1])) links.push(m[1]);
@@ -530,18 +390,14 @@ function genericHtmlAdapter(html, baseUrl) {
 
 // L) Beispieladapter vergabe.muenchen.de.
 //
-// EHRLICHER HINWEIS ZUR GRENZE DIESES ADAPTERS:
-// Dieser Adapter kennt aus deinem Test nur die FELDNAMEN
-// (latestDocumentOid, latestDocumentToken, latestDocumentVersion,
-// latestDocumentDate), nicht die tatsächliche HTML-Struktur der Seite.
-// Deshalb wird hier NICHT wie in der Vorversion ein Download-URL-Pfad
-// geraten, sondern gezielt nach einem echten href/src/action/data-*-Wert
-// gesucht, der oid= UND token= zusammen enthält (also einem Link, den die
-// Seite selbst schon fertig ausliefert). Nur dieser reale Link wird
-// verwendet. Wird kein solcher kombinierter Link gefunden, fällt der
-// Adapter auf den generischen HTML-Adapter zurück UND markiert das
-// Ergebnis so, dass es sichtbar bleibt, dass die München-Spezifik nicht
-// gegriffen hat (kein stiller Fallback ohne Kennzeichnung).
+// EHRLICHER HINWEIS ZUR GRENZE DIESES ADAPTERS: Bekannt sind nur die
+// FELDNAMEN aus deinem Test (latestDocumentOid, latestDocumentToken,
+// latestDocumentVersion, latestDocumentDate), nicht die tatsächliche
+// HTML-Struktur. Es wird daher NICHT ein Downloadpfad geraten, sondern
+// gezielt nach einem im HTML bereits vorhandenen href/src/action/data-*-
+// Wert gesucht, der oid= UND token= zusammen enthält. Nur ein solcher
+// realer Link wird verwendet. Ohne Treffer: sichtbar gekennzeichneter
+// Fallback auf den generischen HTML-Adapter, keine geratene URL.
 function vergabeMuenchenAdapter(html, baseUrl) {
   const versionMatches = [...html.matchAll(/data-version=["']?(\d+)["']?/gi)].map((mm) => parseInt(mm[1], 10));
   const latestVersion = versionMatches.length ? Math.max(...versionMatches) : null;
@@ -550,13 +406,13 @@ function vergabeMuenchenAdapter(html, baseUrl) {
   const tokenMatch = html.match(/[?&]token=([A-Za-z0-9\-_.]+)/i) || html.match(/data-token=["']([A-Za-z0-9\-_.]+)["']/i);
   const dateMatch = html.match(/data-date=["']([^"']+)["']/i);
 
-  const latestDocumentOid = oidMatch ? oidMatch[1] : null;
-  const latestDocumentToken = tokenMatch ? tokenMatch[1] : null;
-  const latestDocumentDate = dateMatch ? dateMatch[1] : null;
-  const meta = { latestDocumentOid, latestDocumentToken, latestDocumentDate, latestDocumentVersion: latestVersion };
+  const meta = {
+    latestDocumentOid: oidMatch ? oidMatch[1] : null,
+    latestDocumentToken: tokenMatch ? tokenMatch[1] : null,
+    latestDocumentDate: dateMatch ? dateMatch[1] : null,
+    latestDocumentVersion: latestVersion,
+  };
 
-  // Suche nach einem bereits im HTML fertig ausgelieferten Link, der
-  // sowohl "oid=" als auch "token=" enthält (href, src, action oder data-*).
   const attrValueRe = /(?:href|src|action|data-[\w-]+)\s*=\s*["']([^"']+)["']/gi;
   const combinedCandidates = [];
   let m;
@@ -566,41 +422,23 @@ function vergabeMuenchenAdapter(html, baseUrl) {
   }
 
   if (!combinedCandidates.length) {
-    return {
-      ...genericHtmlAdapter(html, baseUrl),
-      adapterUsed: "vergabeMuenchen->genericHtmlFallback:NO_COMBINED_OID_TOKEN_LINK_FOUND",
-      meta,
-      latestVersion,
-    };
+    return { ...genericHtmlAdapter(html, baseUrl), adapterUsed: "vergabeMuenchen->genericHtmlFallback:NO_COMBINED_OID_TOKEN_LINK_FOUND", meta, latestVersion };
   }
 
   const downloadUrls = absolutizeAll(combinedCandidates, baseUrl);
   if (!downloadUrls.length) {
-    return {
-      ...genericHtmlAdapter(html, baseUrl),
-      adapterUsed: "vergabeMuenchen->genericHtmlFallback:COMBINED_LINK_NOT_RESOLVABLE",
-      meta,
-      latestVersion,
-    };
+    return { ...genericHtmlAdapter(html, baseUrl), adapterUsed: "vergabeMuenchen->genericHtmlFallback:COMBINED_LINK_NOT_RESOLVABLE", meta, latestVersion };
   }
 
-  return {
-    documentUrls: downloadUrls,
-    latestVersion,
-    adapterUsed: "vergabeMuenchen",
-    meta,
-  };
+  return { documentUrls: downloadUrls, latestVersion, adapterUsed: "vergabeMuenchen", meta };
 }
 
-// N) Beispieladapter für ein Portal mit Login und Session-Cookie:
-// erkennt lediglich, OB ein Login nötig ist / eine Session bereits
-// ausreicht – der eigentliche Login läuft über den
-// Auth/Browser-Orchestrator (siehe n8n/core/auth-browser-orchestrator.js).
+// N) Beispieladapter für ein Portal mit Login und Session-Cookie: erkennt
+// lediglich, OB ein Login nötig ist / eine Session bereits ausreicht.
 function loginSessionPortalAdapter(html, baseUrl, hadValidSession) {
   if (looksLikeLoginForm(html) && !hadValidSession) {
     return { documentUrls: [], latestVersion: null, adapterUsed: "loginSessionPortal", requiresLogin: true };
   }
-  // Mit gültiger Session verhält sich das Portal wie ein normales HTML-Portal.
   return { ...genericHtmlAdapter(html, baseUrl), adapterUsed: "loginSessionPortal", requiresLogin: false };
 }
 
@@ -611,8 +449,7 @@ const ADAPTERS = {
 };
 
 // Portal Adapter Router (Teil C) – reine Objekt-Lookup-Dispatch, KEIN
-// n8n-Switch-Node nötig. Neues Portal = neuer Eintrag in ADAPTERS +
-// PORTAL_CONFIG, kein neuer Node/Workflow.
+// n8n-Switch-Node nötig. Neues Portal = neuer Eintrag, kein neuer Node.
 function routeToAdapter(parserName, html, baseUrl, hadValidSession) {
   const adapterFn = ADAPTERS[parserName] || ADAPTERS.genericHtml;
   try {
@@ -626,67 +463,61 @@ function routeToAdapter(parserName, html, baseUrl, hadValidSession) {
 // =====================================================================
 // 8. UNIVERSAL RESPONSE CLASSIFIER (Teil B)
 // =====================================================================
-function classifyResponse({ result, portalCfg, hadValidSession }) {
-  const { status, headers, body, error } = result;
-  const contentType = headers["content-type"] || headers["Content-Type"] || "";
-  const contentDisposition = headers["content-disposition"] || headers["Content-Disposition"];
+function classifyResponse({ statusCode, headers, buffer, finalUrl, networkError, portalCfg, hadValidSession }) {
+  const contentType = (headers && (headers["content-type"] || headers["Content-Type"])) || "";
+  const contentDisposition = headers && (headers["content-disposition"] || headers["Content-Disposition"]);
 
-  if (status == null) {
-    return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: `NETWORK_ERROR:${error || "UNKNOWN"}`, fileType: null, contentType, isBotChallenge: false };
+  if (networkError || statusCode == null) {
+    return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: `NETWORK_ERROR:${networkError || "NO_STATUS_CODE"}`, retryable: true, fileType: null, contentType };
   }
 
-  const httpErrorClass = classifyHttpError(status, headers);
-  if (httpErrorClass) {
-    return { ...httpErrorClass, fileType: null, contentType, isBotChallenge: status === 403 };
+  const httpErrorClass = classifyHttpError(statusCode, headers);
+  if (httpErrorClass) return { ...httpErrorClass, fileType: null, contentType };
+
+  if (statusCode < 200 || statusCode >= 300) {
+    return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: `UNEXPECTED_HTTP_STATUS:${statusCode}`, retryable: false, fileType: null, contentType };
   }
 
-  if (status < 200 || status >= 300) {
-    return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: `UNEXPECTED_HTTP_STATUS:${status}`, fileType: null, contentType, isBotChallenge: false };
-  }
-
-  if (error === "FILE_TOO_LARGE" || (error && error.startsWith("FILE_TOO_LARGE"))) {
-    return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: error, fileType: null, contentType, isBotChallenge: false };
-  }
-
-  const fileType = detectFileType({ buffer: body, contentTypeHeader: contentType, url: result.finalUrl, contentDisposition });
+  const fileType = detectFileType({ buffer, contentTypeHeader: contentType, url: finalUrl, contentDisposition });
 
   if (fileType.isFile) {
-    return { portalAccessStatus: "DIRECT_FILE", portalAccessReason: `FILE_DETECTED:${fileType.kind}`, fileType, contentType, isBotChallenge: false };
+    return { portalAccessStatus: "DIRECT_FILE", portalAccessReason: `FILE_DETECTED:${fileType.kind}`, retryable: false, fileType, contentType };
   }
 
   if (fileType.kind === "HTML") {
-    const bodyText = decodeBody(body, contentType);
+    const bodyText = decodeBody(buffer, contentType);
     if (looksLikeBotChallenge(bodyText)) {
-      return { portalAccessStatus: "BLOCKED", portalAccessReason: "BOT_CHALLENGE_DETECTED", fileType, contentType, isBotChallenge: true, bodyText };
+      return { portalAccessStatus: "BLOCKED", portalAccessReason: "BOT_CHALLENGE_DETECTED", retryable: false, fileType, contentType, bodyText };
     }
     if (looksLikeLoginForm(bodyText) && !hadValidSession) {
-      return { portalAccessStatus: "AUTH_REQUIRED", portalAccessReason: "LOGIN_FORM_DETECTED", fileType, contentType, isBotChallenge: false, bodyText };
+      return { portalAccessStatus: "AUTH_REQUIRED", portalAccessReason: "LOGIN_FORM_DETECTED", retryable: false, fileType, contentType, bodyText };
     }
     if (portalCfg.requiresBrowser || looksLikeSpaShell(bodyText)) {
-      return { portalAccessStatus: "BROWSER_REQUIRED", portalAccessReason: "SPA_OR_CONFIG_FLAG", fileType, contentType, isBotChallenge: false, bodyText };
+      return { portalAccessStatus: "BROWSER_REQUIRED", portalAccessReason: "SPA_OR_CONFIG_FLAG", retryable: false, fileType, contentType, bodyText };
     }
-    return { portalAccessStatus: "PUBLIC_HTML_WITH_DOWNLOADS", portalAccessReason: "HTML_PAGE_OK", fileType, contentType, isBotChallenge: false, bodyText };
+    return { portalAccessStatus: "PUBLIC_HTML_WITH_DOWNLOADS", portalAccessReason: "HTML_PAGE_OK", retryable: false, fileType, contentType, bodyText };
   }
 
-  return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: fileType.reason || "UNCLASSIFIABLE_RESPONSE", fileType, contentType, isBotChallenge: false };
+  return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: fileType.reason || "UNCLASSIFIABLE_RESPONSE", retryable: false, fileType, contentType };
 }
 
 // =====================================================================
-// 9. HAUPTABLAUF: pro Item verarbeiten
+// 9. HAUPTABLAUF: ein bereits abgeholtes HTTP-Ergebnis klassifizieren
 // =====================================================================
-async function processItem(item, index, helpers, staticData) {
-  const json = item.json;
+function processItem(item, index, staticData) {
+  const json = item.json || {};
   const procurementPortal = json.procurementPortal || "ANDERES_PORTAL";
-  const sourceUrl = json.firstDocumentUrl;
+  const requestUrl = json.requestUrl || json.firstDocumentUrl || json.sourceUrl;
   const processingErrors = [];
+  const retryCountIn = Number(json.retryCount) || 0;
 
   const out = {
     ...json,
     portalAccessStatus: "MANUAL_REVIEW",
     portalAccessReason: "NOT_PROCESSED",
-    sourceUrl,
-    finalUrl: sourceUrl,
-    httpStatus: null,
+    sourceUrl: requestUrl,
+    finalUrl: requestUrl,
+    httpStatus: json.statusCode ?? null,
     contentType: null,
     isDirectFile: false,
     isHtmlPage: false,
@@ -695,46 +526,49 @@ async function processItem(item, index, helpers, staticData) {
     browserRequired: false,
     rateLimited: false,
     documentsFound: 0,
-    documentsDownloaded: 0,
+    documentUrls: [],
     documentNames: [],
-    documentUrls: Array.isArray(json.documentUrls) ? json.documentUrls : [],
     documentMimeTypes: [],
-    downloadSucceeded: false,
     manualReviewRequired: true,
     loginRequired: false,
     portalAdapterUsed: null,
     latestVersionDetected: null,
     processingErrors,
-    sessionCookies: json.sessionCookies || null,
+    sessionCookiesHeader: json.sessionCookiesHeader || "",
+    needsRetry: false,
+    retryCount: retryCountIn,
+    backoffMs: 0,
   };
 
-  if (!sourceUrl) {
-    out.portalAccessReason = "NO_DOCUMENT_URL";
-    processingErrors.push("firstDocumentUrl fehlt");
+  if (!requestUrl) {
+    out.portalAccessReason = "NO_REQUEST_URL";
+    processingErrors.push("requestUrl/firstDocumentUrl fehlt");
     return { json: out, pairedItem: { item: index } };
   }
 
-  const portalCfg = getPortalConfig(procurementPortal, sourceUrl);
+  const portalCfg = getPortalConfig(procurementPortal, requestUrl);
   const domain = portalCfg.resolvedDomain || "unknown";
+  const persistedCookies = json.sessionCookiesHeader ? null : loadPersistedSession(staticData, domain);
+  const existingCookies = parseCookieHeader(json.sessionCookiesHeader) || {};
+  if (persistedCookies) Object.assign(existingCookies, persistedCookies);
+  const hadValidSession = Object.keys(existingCookies).length > 0;
 
-  const persistedCookies = json.sessionCookies || loadPersistedSession(staticData, domain);
-  let cookieJar = persistedCookies || {};
-  const hadValidSession = !!(persistedCookies && Object.keys(persistedCookies).length);
+  // Ergebnis des VORGESCHALTETEN HTTP Request Node (keine eigenen Requests hier).
+  const networkError = json.error || null;
+  const statusCode = json.statusCode ?? null;
+  const headers = json.headers || {};
+  const binaryProp = (item.binary && item.binary.data) || null;
+  const buffer = binaryProp ? Buffer.from(binaryProp.data, "base64") : Buffer.alloc(0);
 
-  // --- 1. Probe-Request (inkl. manuellem Redirect-Walk + Retry/Backoff) ---
-  const result = await robustRequest(helpers, { url: sourceUrl, cookieHeader: cookiesToHeader(cookieJar) });
-  out.finalUrl = result.finalUrl || sourceUrl;
-  out.httpStatus = result.status;
-  if (result.cookieJar && Object.keys(result.cookieJar).length) {
-    cookieJar = mergeCookies(cookieJar, result.cookieJar);
-    persistSession(staticData, domain, cookieJar);
-  }
+  const freshCookies = parseSetCookies(headers);
+  const mergedCookies = { ...existingCookies, ...freshCookies };
+  out.sessionCookiesHeader = cookiesToHeader(mergedCookies);
+  if (Object.keys(mergedCookies).length) persistSession(staticData, domain, mergedCookies);
 
-  const classification = classifyResponse({ result, portalCfg, hadValidSession });
+  const classification = classifyResponse({ statusCode, headers, buffer, finalUrl: requestUrl, networkError, portalCfg, hadValidSession });
   out.portalAccessStatus = classification.portalAccessStatus;
   out.portalAccessReason = classification.portalAccessReason;
   out.contentType = classification.contentType || null;
-  out.sessionCookies = Object.keys(cookieJar).length ? cookieJar : null;
 
   out.authRequired = classification.portalAccessStatus === "AUTH_REQUIRED";
   out.loginRequired = out.authRequired;
@@ -742,27 +576,44 @@ async function processItem(item, index, helpers, staticData) {
   out.rateLimited = classification.portalAccessStatus === "RATE_LIMITED";
   out.manualReviewRequired = ["MANUAL_REVIEW", "BLOCKED"].includes(classification.portalAccessStatus);
 
-  // --- 2. DIRECT_FILE: sofort als heruntergeladen verbuchen ---
-  if (classification.portalAccessStatus === "DIRECT_FILE") {
-    out.isDirectFile = true;
-    out.documentUrls = [out.finalUrl];
-    out.documentsFound = 1;
-    out.portalAdapterUsed = "direct";
-    const filename = getFilenameFromContentDisposition(result.headers["content-disposition"]) || `document.${classification.fileType.ext}`;
-    item.binary = item.binary || {};
-    item.binary.doc_0 = await helpers.prepareBinaryData(result.body, filename, classification.fileType.mime);
-    out.documentNames = [filename];
-    out.documentMimeTypes = [classification.fileType.mime];
-    out.documentsDownloaded = 1;
-    out.downloadSucceeded = true;
-    out.manualReviewRequired = false;
-    return { json: out, binary: item.binary, pairedItem: { item: index } };
+  // --- Retry-Entscheidung (reine Berechnung, KEIN Sleep/HTTP hier) ---
+  if (classification.retryable && retryCountIn < MAX_RETRY_COUNT) {
+    const retryAfterMs = statusCode === 429 ? parseRetryAfter(headers) : null;
+    const computedBackoff = retryAfterMs != null ? retryAfterMs : Math.min(2000 * 2 ** retryCountIn, 20000);
+    if (computedBackoff <= INLINE_RETRY_MAX_WAIT_MS || statusCode !== 429) {
+      out.needsRetry = true;
+      out.backoffMs = computedBackoff;
+      out.retryCount = retryCountIn + 1;
+      // Status bleibt wie klassifiziert (z.B. RATE_LIMITED/MANUAL_REVIEW) UND
+      // needsRetry=true – die IF-Node im Hauptworkflow entscheidet anhand
+      // von needsRetry, ob zurück zum HTTP Request Node geloopt wird,
+      // bevor Telegram/Gate den Status final auswerten.
+    }
   }
 
-  // --- 3. HTML: Adapter zur Linkextraktion aufrufen ---
-  if (classification.portalAccessStatus === "PUBLIC_HTML_WITH_DOWNLOADS" || classification.portalAccessStatus === "SESSION_REQUIRED") {
+  // --- DIRECT_FILE: vorhandenes Binary nur umbenennen (KEIN prepareBinaryData) ---
+  if (classification.portalAccessStatus === "DIRECT_FILE") {
+    out.isDirectFile = true;
+    out.documentUrls = [requestUrl];
+    out.documentsFound = 1;
+    out.portalAdapterUsed = "direct";
+    const docIndex = Number.isInteger(json.docIndex) ? json.docIndex : 0;
+    const filename = getFilenameFromContentDisposition(headers["content-disposition"]) || `document_${docIndex}.${classification.fileType.ext}`;
+
+    const resultItem = { json: out, pairedItem: { item: index } };
+    if (binaryProp) {
+      resultItem.binary = { [`doc_${docIndex}`]: { ...binaryProp, fileName: binaryProp.fileName || filename, mimeType: classification.fileType.mime || binaryProp.mimeType } };
+    }
+    out.documentNames = [filename];
+    out.documentMimeTypes = [classification.fileType.mime];
+    return resultItem;
+  }
+
+  // --- HTML: Adapter zur Linkextraktion aufrufen (nur im Sondierungs-Schritt,
+  // nicht wenn wir bereits einen einzelnen Dokumentlink abrufen) ---
+  if (!json.isDocumentSubFetch && (classification.portalAccessStatus === "PUBLIC_HTML_WITH_DOWNLOADS" || classification.portalAccessStatus === "SESSION_REQUIRED")) {
     out.isHtmlPage = true;
-    const adapterResult = routeToAdapter(portalCfg.parserName, classification.bodyText, out.finalUrl, hadValidSession);
+    const adapterResult = routeToAdapter(portalCfg.parserName, classification.bodyText, requestUrl, hadValidSession);
     out.portalAdapterUsed = adapterResult.adapterUsed;
     out.latestVersionDetected = adapterResult.latestVersion ?? adapterResult.meta?.latestDocumentVersion ?? null;
 
@@ -783,55 +634,20 @@ async function processItem(item, index, helpers, staticData) {
       out.portalAccessStatus = "MANUAL_REVIEW";
       out.portalAccessReason = "NO_DOWNLOAD_LINKS_FOUND_IN_HTML";
       out.manualReviewRequired = true;
-      return { json: out, pairedItem: { item: index } };
     }
-
-    // --- 4. Alle gefundenen Dokumente herunterladen ---
-    item.binary = item.binary || {};
-    let idx = 0;
-    for (const docUrl of docUrls) {
-      const docResult = await robustRequest(helpers, { url: docUrl, cookieHeader: cookiesToHeader(cookieJar) });
-      if (docResult.cookieJar && Object.keys(docResult.cookieJar).length) {
-        cookieJar = mergeCookies(cookieJar, docResult.cookieJar);
-        persistSession(staticData, domain, cookieJar);
-      }
-
-      const hasSessionNow = Object.keys(cookieJar).length > 0;
-      const docClass = classifyResponse({ result: docResult, portalCfg, hadValidSession: hasSessionNow });
-      if (docClass.portalAccessStatus !== "DIRECT_FILE") {
-        processingErrors.push(`Download fehlgeschlagen für ${docUrl}: ${docClass.portalAccessReason}`);
-        continue;
-      }
-      const filename = getFilenameFromContentDisposition(docResult.headers["content-disposition"]) || `document_${idx}.${docClass.fileType.ext}`;
-      item.binary[`doc_${idx}`] = await helpers.prepareBinaryData(docResult.body, filename, docClass.fileType.mime);
-      out.documentNames.push(filename);
-      out.documentMimeTypes.push(docClass.fileType.mime);
-      idx += 1;
-    }
-
-    out.documentsDownloaded = idx;
-    out.downloadSucceeded = idx > 0 && idx === docUrls.length;
-    out.sessionCookies = Object.keys(cookieJar).length ? cookieJar : null;
-
-    if (idx === 0) {
-      out.portalAccessStatus = "MANUAL_REVIEW";
-      out.portalAccessReason = "ALL_DOCUMENT_DOWNLOADS_FAILED";
-      out.manualReviewRequired = true;
-    } else if (idx < docUrls.length) {
-      out.portalAccessStatus = "MANUAL_REVIEW";
-      out.portalAccessReason = `PARTIAL_DOWNLOAD:${idx}/${docUrls.length}`;
-      out.manualReviewRequired = true;
-    } else {
-      out.manualReviewRequired = false;
-    }
-    return { json: out, binary: item.binary, pairedItem: { item: index } };
+    // WICHTIG: Das eigentliche Herunterladen jedes Eintrags in `documentUrls`
+    // übernehmen separate HTTP-Request-Nodes im Hauptworkflow (siehe
+    // Antwort-Text Punkt 6) – dieser Node lädt hier nichts nach.
+    return { json: out, pairedItem: { item: index } };
   }
 
-  // --- 5. AUTH_REQUIRED / BROWSER_REQUIRED / RATE_LIMITED / BLOCKED / MANUAL_REVIEW ---
-  // Wird unverändert an den Hauptworkflow zurückgegeben; dort entscheidet
-  // die IF-Node über Auth/Browser-Orchestrator bzw. Telegram-Fehlermeldung.
-  // documentAccessStatus wird HIER NIE gesetzt – das bleibt ausschließlich
-  // dem Gate-Node vorbehalten (Teile R/S/T).
+  // --- isDocumentSubFetch, aber kein DIRECT_FILE (z.B. Session doch
+  // abgelaufen -> Login-Seite statt Dokument) ---
+  if (json.isDocumentSubFetch) {
+    processingErrors.push(`Dokument-Download lieferte keine Datei: ${classification.portalAccessReason}`);
+  }
+
+  // --- AUTH_REQUIRED / BROWSER_REQUIRED / RATE_LIMITED / BLOCKED / MANUAL_REVIEW ---
   return { json: out, pairedItem: { item: index } };
 }
 
@@ -842,6 +658,6 @@ const staticData = $getWorkflowStaticData("global");
 const items = $input.all();
 const results = [];
 for (let i = 0; i < items.length; i++) {
-  results.push(await processItem(items[i], i, $helpers, staticData));
+  results.push(processItem(items[i], i, staticData));
 }
 return results;
