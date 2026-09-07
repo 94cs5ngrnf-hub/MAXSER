@@ -53,8 +53,13 @@ function aggregateGroup(groupItems) {
   const isMultiItemGroup = groupItems.length > 1;
 
   const documentsFound = Math.max(0, ...groupItems.map((i) => Number(i.json.documentsFound) || 0));
-  const successfulItems = groupItems.filter((i) => i.json.isDirectFile === true);
+  // documentDownloadSucceeded (explizites Signal aus dem Classifier) ist die
+  // primäre Quelle; isDirectFile als Fallback für ältere/abweichende Items.
+  const successfulItems = groupItems.filter((i) => i.json.documentDownloadSucceeded === true || i.json.isDirectFile === true);
   const documentsDownloaded = successfulItems.length;
+  const failedDocIndexes = groupItems
+    .filter((i) => i.json.documentDownloadFailed === true)
+    .map((i) => i.json.docIndex);
 
   const documentNames = [];
   const documentMimeTypes = [];
@@ -109,6 +114,7 @@ function aggregateGroup(groupItems) {
   if (documentsFound <= 0) reasons.push("NO_DOCUMENTS_FOUND");
   if (documentsDownloaded !== documentsFound) reasons.push(`INCOMPLETE_DOWNLOAD:${documentsDownloaded}/${documentsFound}`);
   if (documentsDownloaded > 0 && binaryCount !== documentsDownloaded) reasons.push(`BINARY_COUNT_MISMATCH:${binaryCount}!=${documentsDownloaded}`);
+  if (failedDocIndexes.length) reasons.push(`DOCUMENT_DOWNLOAD_FAILED_AT_INDEX:${failedDocIndexes.join(",")}`);
 
   out.documentAccessStatus = reasons.length ? "PRÜFEN" : "OK"; // Teile S/T: Default ist immer PRÜFEN, OK nur bei vollständigem, verifiziertem Erfolg
   out.documentAccessReasons = reasons;

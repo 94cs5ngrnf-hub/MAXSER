@@ -40,12 +40,19 @@
  *
  * Erzeugte Ausgabe je Item (json):
  *   portalAccessStatus, portalAccessReason, sourceUrl, finalUrl, httpStatus,
- *   contentType, isDirectFile, isHtmlPage, authRequired, sessionRequired,
- *   browserRequired, mfaRequired, rateLimited, downloadResolverRequired,
- *   downloadResolverMetadata, documentsFound, documentUrls, documentNames,
- *   documentMimeTypes, manualReviewRequired, loginRequired,
- *   portalAdapterUsed, latestVersionDetected, processingErrors,
- *   sessionCookiesHeader, needsRetry, retryCount, backoffMs
+ *   contentType, isDirectFile, documentDownloadSucceeded, documentDownloadFailed,
+ *   isHtmlPage, authRequired, sessionRequired, browserRequired, mfaRequired,
+ *   rateLimited, downloadResolverRequired, downloadResolverMetadata,
+ *   documentsFound, documentUrls, documentNames, documentMimeTypes,
+ *   manualReviewRequired, loginRequired, portalAdapterUsed,
+ *   latestVersionDetected, processingErrors, sessionCookiesHeader,
+ *   needsRetry, retryCount, backoffMs
+ *
+ * documentDownloadSucceeded/documentDownloadFailed sind explizite,
+ * ausschließlich für das nachgelagerte Aggregations-/Gate-Item gedachte
+ * Bool-Signale je EINZELDOKUMENT (gesetzt bei DIRECT_FILE bzw. bei einem
+ * fehlgeschlagenen isDocumentSubFetch) – zusätzlich zu, nicht statt,
+ * isDirectFile.
  * Binärdaten: bei DIRECT_FILE / isDocumentSubFetch wird das vorhandene
  * item.binary.data 1:1 nach item.binary.doc_<docIndex> umbenannt
  * (KEIN prepareBinaryData nötig – reine Objekt-Zuweisung).
@@ -635,6 +642,8 @@ async function processItem(item, index, staticData) {
     httpStatus: json.statusCode ?? null,
     contentType: null,
     isDirectFile: false,
+    documentDownloadSucceeded: false, // explizites Signal je Einzeldokument fürs Gate (Teil G), unabhängig von isDirectFile
+    documentDownloadFailed: false,
     isHtmlPage: false,
     authRequired: false,
     sessionRequired: false,
@@ -749,6 +758,7 @@ async function processItem(item, index, staticData) {
   // --- DIRECT_FILE: vorhandenes Binary nur umbenennen (KEIN prepareBinaryData) ---
   if (classification.portalAccessStatus === "DIRECT_FILE") {
     out.isDirectFile = true;
+    out.documentDownloadSucceeded = true;
     out.documentUrls = [requestUrl];
     out.documentsFound = 1;
     out.portalAdapterUsed = "direct";
@@ -820,7 +830,8 @@ async function processItem(item, index, staticData) {
   // --- isDocumentSubFetch, aber kein DIRECT_FILE (z.B. Session doch
   // abgelaufen -> Login-Seite statt Dokument) ---
   if (json.isDocumentSubFetch) {
-    processingErrors.push(`Dokument-Download lieferte keine Datei: ${classification.portalAccessReason}`);
+    out.documentDownloadFailed = true; // explizites Signal fürs Gate, statt nur String-Text in processingErrors
+    processingErrors.push(`Dokument-Download #${json.docIndex ?? "?"} fehlgeschlagen: ${classification.portalAccessReason}`);
   }
 
   // --- AUTH_REQUIRED / BROWSER_REQUIRED / RATE_LIMITED / BLOCKED / MANUAL_REVIEW ---
