@@ -363,6 +363,16 @@ function looksLikeLoginForm(bodyText) {
   return /<input[^>]*type=["']password["']/i.test(t) || (t.includes("benutzername") && t.includes("passwort")) || (t.includes("username") && t.includes("password"));
 }
 
+// Zusätzliche Absicherung gegen False-Positive AUTH_REQUIRED: Seiten mit
+// diesen Markern behandeln erkennbar ein Vergabeverfahren (auch wenn der
+// generische Linkscanner zufällig 0 Links fand, z.B. weil Downloads über
+// eine noch nicht erkannte Struktur eingebunden sind) – dann lieber
+// MANUAL_REVIEW statt fälschlich AUTH_REQUIRED zu melden.
+const TENDER_MARKER_RE = /tenderingproceduredetails|tenderoid|vergabeunterlagen|vergabeverfahren|ausschreibung|leistungsverzeichnis|data-oid|data-token|specificationversion|download/i;
+function hasTenderMarkers(bodyText) {
+  return TENDER_MARKER_RE.test(bodyText || "");
+}
+
 function looksLikeSpaShell(bodyText) {
   const t = bodyText || "";
   const strippedLength = t.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<[^>]+>/g, "").trim().length;
@@ -391,6 +401,13 @@ function genericHtmlAdapter(html, baseUrl) {
   }
   const dataAttrRe = /data-(?:href|download-url|file-url|url)=["']([^"']+)["']/gi;
   while ((m = dataAttrRe.exec(html)) !== null) {
+    if (DOC_EXT_RE.test(m[1])) links.push(m[1]);
+  }
+  // Auch src=/action= mit Datei-Endung erfassen (z.B. <iframe src="...pdf">,
+  // <form action="...download.pdf">) – weiterhin nur echte, im HTML
+  // vorhandene Werte, keine konstruierten URLs.
+  const srcActionRe = /(?:src|action)=["']([^"']+)["']/gi;
+  while ((m = srcActionRe.exec(html)) !== null) {
     if (DOC_EXT_RE.test(m[1])) links.push(m[1]);
   }
   const absoluteUrls = absolutizeAll(links, baseUrl);
@@ -574,15 +591,29 @@ function classifyResponse({ statusCode, headers, buffer, finalUrl, networkError,
  * bevorzugte Pfad in deiner Instanz greift.
  */
 async function readBinaryBuffer(binaryProp, index) {
-  if (!binaryProp) return Buffer.alloc(0);
+  if (!binaryProp) return { buffer: Buffer.alloc(0), error: null };
+
   if (typeof $helpers !== "undefined" && $helpers && typeof $helpers.getBinaryDataBuffer === "function") {
     try {
-      return await $helpers.getBinaryDataBuffer(index, "data");
+      const buffer = await $helpers.getBinaryDataBuffer(index, "data");
+      return { buffer, error: null };
     } catch (err) {
-      // fällt durch auf den garantierten Fallback unten
+      // fällt durch auf den garantierten Fallback unten – Fehler wird
+      // trotzdem gemeldet, damit er im Item sichtbar bleibt, aber die
+      // Ausführung nicht abbricht.
+      try {
+        return { buffer: Buffer.from(binaryProp.data, "base64"), error: `getBinaryDataBuffer fehlgeschlagen (Fallback auf Base64 genutzt): ${err.message}` };
+      } catch (fallbackErr) {
+        return { buffer: Buffer.alloc(0), error: `Binary-Lesefehler (beide Wege fehlgeschlagen): ${err.message} / ${fallbackErr.message}` };
+      }
     }
   }
-  return Buffer.from(binaryProp.data, "base64");
+
+  try {
+    return { buffer: Buffer.from(binaryProp.data, "base64"), error: null };
+  } catch (err) {
+    return { buffer: Buffer.alloc(0), error: `Binary-Lesefehler (Base64): ${err.message}` };
+  }
 }
 
 // =====================================================================
@@ -645,7 +676,8 @@ async function processItem(item, index, staticData) {
   const statusCode = json.statusCode ?? null;
   const headers = json.headers || {};
   const binaryProp = (item.binary && item.binary.data) || null;
-  const buffer = await readBinaryBuffer(binaryProp, index);
+  const { buffer, error: binaryReadError } = await readBinaryBuffer(binaryProp, index);
+  if (binaryReadError) processingErrors.push(binaryReadError);
 
   const freshCookies = parseSetCookies(headers);
   const mergedCookies = { ...existingCookies, ...freshCookies };
@@ -761,10 +793,13 @@ async function processItem(item, index, staticData) {
     if (!docUrls.length) {
       // Login-Check erst JETZT, mit dem echten Ergebnis der Dokumentensuche:
       // nur wenn ein Passwortfeld erkannt wurde UND der Adapter wirklich
-      // NICHTS gefunden hat, gilt die Seite als Login-geschützt. Das
-      // vermeidet False-Positives bei Seiten mit optionalem Bieter-Login
-      // neben öffentlichen Downloads.
-      if (classification.hasLoginForm) {
+      // NICHTS gefunden hat UND die Seite keine Vergabe-/Tender-Marker
+      // enthält, gilt sie als Login-geschützt. Das vermeidet False-Positives
+      // bei Seiten mit optionalem Bieter-Login neben öffentlichen Downloads
+      // ODER bei Vergabeseiten, deren Downloadstruktur der generische
+      // Linkscanner (noch) nicht erkennt – dann lieber MANUAL_REVIEW als
+      // fälschlich AUTH_REQUIRED.
+      if (classification.hasLoginForm && !hasTenderMarkers(classification.bodyText)) {
         out.portalAccessStatus = "AUTH_REQUIRED";
         out.portalAccessReason = "LOGIN_FORM_DETECTED_NO_DOCUMENTS_FOUND";
         out.authRequired = true;
