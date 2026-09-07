@@ -604,29 +604,30 @@ function classifyResponse({ statusCode, headers, buffer, finalUrl, networkError,
 /**
  * Liest die Binärdaten des Response-Bodys als Buffer.
  *
- * Bevorzugt (falls verfügbar): `$helpers.getBinaryDataBuffer(index, "data")`
- * – das ist die EINZIGE Methode, die in JEDEM n8n-Binary-Data-Modus korrekt
- * liest (inline/base64 UND filesystem UND S3, je nach
- * N8N_DEFAULT_BINARY_DATA_MODE der Instanz). Diese Methode ist aber NICHT
- * in jeder n8n-Version/Instanz als Code-Node-API garantiert – deshalb wird
- * sie nur verwendet, wenn sie zur Laufzeit tatsächlich als Funktion
- * vorhanden ist (Feature Detection, kein Raten).
+ * Bevorzugt (falls verfügbar): eine bereits gebundene
+ * `getBinaryDataBuffer(index, "data")`-Funktion – das ist die einzige
+ * Methode, die in JEDEM n8n-Binary-Data-Modus korrekt liest (inline/base64
+ * UND filesystem UND S3). Diese Funktion wird NICHT hier aufgelöst,
+ * sondern einmalig am Skript-Anfang (siehe ENTRY POINT) – dort ist
+ * sowohl `$helpers` als auch `this` (falls vorhanden) sicher zugreifbar.
+ * In einer separaten Funktion wäre `this` NICHT mehr die n8n-Execution-
+ * Context (normale Funktionsaufrufe verlieren die this-Bindung) – deshalb
+ * wird die fertig gebundene Funktion als Parameter durchgereicht statt
+ * hier erneut `this.helpers`/`$helpers` zu prüfen.
  *
  * Fallback (funktioniert IMMER, in jeder Version): rohes Base64-Feld
  * `binaryProp.data` dekodieren. Das ist korrekt im n8n-Standardmodus
  * ("default", inline gespeichert). Läuft deine Instanz mit
  * N8N_DEFAULT_BINARY_DATA_MODE=filesystem oder =s3, enthält `binaryProp.data`
  * KEINEN Base64-String mehr, sondern eine interne Referenz-ID – dann liefert
- * dieser Fallback falsche Bytes. Prüfe im Zweifel einmal mit einem
- * `console.log(typeof $helpers?.getBinaryDataBuffer)`-Testlauf, ob der
- * bevorzugte Pfad in deiner Instanz greift.
+ * dieser Fallback falsche Bytes.
  */
-async function readBinaryBuffer(binaryProp, index) {
+async function readBinaryBuffer(binaryProp, index, boundGetBinaryDataBuffer) {
   if (!binaryProp) return { buffer: Buffer.alloc(0), error: null };
 
-  if (typeof $helpers !== "undefined" && $helpers && typeof $helpers.getBinaryDataBuffer === "function") {
+  if (typeof boundGetBinaryDataBuffer === "function") {
     try {
-      const buffer = await $helpers.getBinaryDataBuffer(index, "data");
+      const buffer = await boundGetBinaryDataBuffer(index, "data");
       return { buffer, error: null };
     } catch (err) {
       // fällt durch auf den garantierten Fallback unten – Fehler wird
@@ -650,7 +651,7 @@ async function readBinaryBuffer(binaryProp, index) {
 // =====================================================================
 // 9. HAUPTABLAUF: ein bereits abgeholtes HTTP-Ergebnis klassifizieren
 // =====================================================================
-async function processItem(item, index, staticData) {
+async function processItem(item, index, staticData, boundGetBinaryDataBuffer) {
   const json = item.json || {};
   const procurementPortal = json.procurementPortal || "ANDERES_PORTAL";
   const requestUrl = json.requestUrl || json.firstDocumentUrl || json.sourceUrl;
@@ -714,7 +715,7 @@ async function processItem(item, index, staticData) {
   const statusCode = json.statusCode ?? null;
   const headers = json.headers || {};
   const binaryProp = (item.binary && item.binary.data) || null;
-  const { buffer, error: binaryReadError } = await readBinaryBuffer(binaryProp, index);
+  const { buffer, error: binaryReadError } = await readBinaryBuffer(binaryProp, index, boundGetBinaryDataBuffer);
   if (binaryReadError) processingErrors.push(binaryReadError);
 
   const freshCookies = parseSetCookies(headers);
@@ -873,9 +874,22 @@ async function processItem(item, index, staticData) {
 // ENTRY POINT
 // =====================================================================
 const staticData = $getWorkflowStaticData("global");
+
+// Einmalig hier auflösen (nicht in einer separaten Funktion – dort wäre
+// `this` nicht mehr die n8n-Execution-Context). $helpers zuerst versuchen,
+// dann this.helpers als Fallback (in mind. einer echten n8n-Cloud-Instanz
+// bestätigt funktionierend), zuletzt bleibt der garantierte Base64-Weg in
+// readBinaryBuffer().
+let boundGetBinaryDataBuffer = null;
+if (typeof $helpers !== "undefined" && $helpers && typeof $helpers.getBinaryDataBuffer === "function") {
+  boundGetBinaryDataBuffer = $helpers.getBinaryDataBuffer.bind($helpers);
+} else if (typeof this !== "undefined" && this && this.helpers && typeof this.helpers.getBinaryDataBuffer === "function") {
+  boundGetBinaryDataBuffer = this.helpers.getBinaryDataBuffer.bind(this.helpers);
+}
+
 const items = $input.all();
 const results = [];
 for (let i = 0; i < items.length; i++) {
-  results.push(await processItem(items[i], i, staticData));
+  results.push(await processItem(items[i], i, staticData, boundGetBinaryDataBuffer));
 }
 return results;
