@@ -322,6 +322,30 @@ function persistSession(staticData, domain, cookies, ttlMs = 25 * 60 * 1000) {
   staticData.sessions[domain] = { cookies, expiresAt: Date.now() + ttlMs };
 }
 
+// Gleiches Prinzip wie oben, aber für retryCount statt Cookies: schützt
+// gegen genau den Bug, bei dem ein Node zwischen HTTP Request und
+// Classifier (z.B. "Restore Probe Metadata") retryCount bei jedem Retry
+// unabsichtlich auf den Ursprungswert zurücksetzt (weil er von einem nur
+// einmal laufenden Node wie "Prepare Request" gelesen wird). Ohne dieses
+// Sicherheitsnetz würde retryCountIn nie über 0 hinauskommen und die
+// MAX_RETRY_COUNT/MAX_SESSION_HANDSHAKE_RETRIES-Grenzen würden nie greifen
+// -> potenziell sehr viele Wiederholungen statt sauber MANUAL_REVIEW.
+function retryStateKey(json) {
+  const tenderKey = json._tenderKey || "unknown";
+  return json.isDocumentSubFetch ? `${tenderKey}::doc${json.docIndex ?? "?"}` : `${tenderKey}::probe`;
+}
+
+function loadPersistedRetryCount(staticData, key) {
+  const entry = staticData.retryState && staticData.retryState[key];
+  if (entry && entry.expiresAt > Date.now()) return entry.retryCount;
+  return 0;
+}
+
+function persistRetryCount(staticData, key, retryCount, ttlMs = 10 * 60 * 1000) {
+  if (!staticData.retryState) staticData.retryState = {};
+  staticData.retryState[key] = { retryCount, expiresAt: Date.now() + ttlMs };
+}
+
 // =====================================================================
 // 6. FEHLERHANDLER (Teil F) – reine Zuordnung, KEIN Sleep/Retry hier.
 // Retry/Backoff läuft als echte Graph-Schleife: dieser Node liefert nur
@@ -631,7 +655,12 @@ async function processItem(item, index, staticData) {
   const procurementPortal = json.procurementPortal || "ANDERES_PORTAL";
   const requestUrl = json.requestUrl || json.firstDocumentUrl || json.sourceUrl;
   const processingErrors = [];
-  const retryCountIn = Number(json.retryCount) || 0;
+  const retryKey = retryStateKey(json);
+  // Math.max statt nur json.retryCount: falls ein Node zwischen HTTP
+  // Request und diesem Classifier retryCount versehentlich zurücksetzt,
+  // gewinnt der zuletzt in staticData persistierte (höhere) Wert – siehe
+  // persistRetryCount() weiter oben.
+  const retryCountIn = Math.max(Number(json.retryCount) || 0, loadPersistedRetryCount(staticData, retryKey));
 
   const out = {
     ...json,
@@ -730,6 +759,7 @@ async function processItem(item, index, staticData) {
     out.needsRetry = true;
     out.backoffMs = 0;
     out.retryCount = retryCountIn + 1;
+    persistRetryCount(staticData, retryKey, out.retryCount);
     out.manualReviewRequired = false;
     return { json: out, pairedItem: { item: index } };
   }
@@ -748,6 +778,7 @@ async function processItem(item, index, staticData) {
       out.needsRetry = true;
       out.backoffMs = computedBackoff;
       out.retryCount = retryCountIn + 1;
+      persistRetryCount(staticData, retryKey, out.retryCount);
       // Status bleibt wie klassifiziert (z.B. RATE_LIMITED/MANUAL_REVIEW) UND
       // needsRetry=true – die IF-Node im Hauptworkflow entscheidet anhand
       // von needsRetry, ob zurück zum HTTP Request Node geloopt wird,
