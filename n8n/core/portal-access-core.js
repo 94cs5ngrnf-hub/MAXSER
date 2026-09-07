@@ -34,8 +34,9 @@
  * Erzeugte Ausgabe je Item (json):
  *   portalAccessStatus, portalAccessReason, sourceUrl, finalUrl, httpStatus,
  *   contentType, isDirectFile, isHtmlPage, authRequired, sessionRequired,
- *   browserRequired, rateLimited, documentsFound, documentUrls,
- *   documentNames, documentMimeTypes, manualReviewRequired, loginRequired,
+ *   browserRequired, mfaRequired, rateLimited, downloadResolverRequired,
+ *   downloadResolverMetadata, documentsFound, documentUrls, documentNames,
+ *   documentMimeTypes, manualReviewRequired, loginRequired,
  *   portalAdapterUsed, latestVersionDetected, processingErrors,
  *   sessionCookiesHeader, needsRetry, retryCount, backoffMs
  * Binärdaten: bei DIRECT_FILE / isDocumentSubFetch wird das vorhandene
@@ -64,24 +65,24 @@ const INLINE_RETRY_MAX_WAIT_MS = 15000; // > 15s Wartezeit -> nicht mehr automat
 // bereits real getestete Portale (siehe docs/architecture.md, Abschnitt O).
 const PORTAL_CONFIG = {
   EVERGABE: { domain: null, verified: false, requiresBrowser: false, parserName: "genericHtml" },
-  EVERGABE_ONLINE: { domain: "evergabe-online.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
-  DEUTSCHE_EVERGABE: { domain: "deutsche-evergabe.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
-  BERLIN_VERGABE: { domain: "vergabe.berlin.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
-  BRANDENBURG_VERGABE: { domain: "vergabemarktplatz.brandenburg.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
-  SACHSEN_ANHALT_VERGABE: { domain: "evergabe.sachsen-anhalt.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
-  SACHSEN_VERGABE: { domain: "evergabe.sachsen.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  EVERGABE_ONLINE: { domain: "evergabe-online.de", verified: false, requiresBrowser: false, parserName: "evergabeOnline" },
+  DEUTSCHE_EVERGABE: { domain: "deutsche-evergabe.de", verified: false, requiresBrowser: false, parserName: "deutscheEvergabe" },
+  BERLIN_VERGABE: { domain: "vergabe.berlin.de", verified: false, requiresBrowser: false, parserName: "berlinVergabe" },
+  BRANDENBURG_VERGABE: { domain: "vergabemarktplatz.brandenburg.de", verified: false, requiresBrowser: false, parserName: "brandenburgVergabe" },
+  SACHSEN_ANHALT_VERGABE: { domain: "evergabe.sachsen-anhalt.de", verified: false, requiresBrowser: false, parserName: "sachsenAnhaltVergabe" },
+  SACHSEN_VERGABE: { domain: "evergabe.sachsen.de", verified: false, requiresBrowser: false, parserName: "sachsenVergabe" },
   MV_LAND_VERGABE: { domain: null, verified: false, requiresBrowser: false, parserName: "genericHtml" },
   MV_EVERGABE: { domain: null, verified: false, requiresBrowser: false, parserName: "genericHtml" },
-  BAYERN_VERGABE: { domain: "vergabe.bayern.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  BAYERN_VERGABE: { domain: "vergabe.bayern.de", verified: false, requiresBrowser: false, parserName: "bayernVergabe" },
   MUENCHEN_VERGABE: { domain: "vergabe.muenchen.de", verified: true, requiresBrowser: false, parserName: "vergabeMuenchen" },
   BADEN_WUERTTEMBERG_VERGABE: { domain: null, verified: false, requiresBrowser: false, parserName: "genericHtml" },
-  DTVP: { domain: "dtvp.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  DTVP: { domain: "dtvp.de", verified: false, requiresBrowser: false, parserName: "dtvp" },
   VMP_RHEINLAND: { domain: null, verified: false, requiresBrowser: false, parserName: "genericHtml" },
-  SUBREPORT: { domain: "subreport.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
-  BREMEN_VERGABE: { domain: "vergabe.bremen.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  SUBREPORT: { domain: "subreport.de", verified: false, requiresBrowser: false, parserName: "subreport" },
+  BREMEN_VERGABE: { domain: "vergabe.bremen.de", verified: false, requiresBrowser: false, parserName: "bremenVergabe" },
   METROPOLE_RUHR: { domain: "vergabe.metropoleruhr.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
   AUMASS: { domain: null, verified: false, requiresBrowser: false, parserName: "genericHtml" },
-  HAD_HESSEN: { domain: "had.de", verified: false, requiresBrowser: false, parserName: "genericHtml" },
+  HAD_HESSEN: { domain: "had.de", verified: false, requiresBrowser: false, parserName: "hadHessen" },
   TED: { domain: "ted.europa.eu", verified: false, requiresBrowser: false, parserName: "genericHtml" },
   ANDERES_PORTAL: { domain: null, verified: false, requiresBrowser: false, parserName: "genericHtml" },
 };
@@ -422,12 +423,27 @@ function vergabeMuenchenAdapter(html, baseUrl) {
   }
 
   if (!combinedCandidates.length) {
-    return { ...genericHtmlAdapter(html, baseUrl), adapterUsed: "vergabeMuenchen->genericHtmlFallback:NO_COMBINED_OID_TOKEN_LINK_FOUND", meta, latestVersion };
+    // Teil 8 ("nicht raten"): oid/token wurden gefunden, aber KEIN echter
+    // Downloadlink dazu. Statt zu raten, wird die Metadaten strukturiert
+    // ausgegeben und downloadResolverRequired=true gesetzt.
+    return {
+      ...genericHtmlAdapter(html, baseUrl),
+      adapterUsed: "vergabeMuenchen->genericHtmlFallback:NO_COMBINED_OID_TOKEN_LINK_FOUND",
+      meta, latestVersion,
+      downloadResolverRequired: true,
+      downloadResolverMetadata: meta,
+    };
   }
 
   const downloadUrls = absolutizeAll(combinedCandidates, baseUrl);
   if (!downloadUrls.length) {
-    return { ...genericHtmlAdapter(html, baseUrl), adapterUsed: "vergabeMuenchen->genericHtmlFallback:COMBINED_LINK_NOT_RESOLVABLE", meta, latestVersion };
+    return {
+      ...genericHtmlAdapter(html, baseUrl),
+      adapterUsed: "vergabeMuenchen->genericHtmlFallback:COMBINED_LINK_NOT_RESOLVABLE",
+      meta, latestVersion,
+      downloadResolverRequired: true,
+      downloadResolverMetadata: meta,
+    };
   }
 
   return { documentUrls: downloadUrls, latestVersion, adapterUsed: "vergabeMuenchen", meta };
@@ -442,10 +458,34 @@ function loginSessionPortalAdapter(html, baseUrl, hadValidSession) {
   return { ...genericHtmlAdapter(html, baseUrl), adapterUsed: "loginSessionPortal", requiresLogin: false };
 }
 
+// Benannte Adapter-Aliasse (Teil 7): Diese Portale haben noch KEINE
+// verifizierte, abweichende HTML-Struktur bekannt – sie verhalten sich
+// aktuell wie genericHtml, tragen aber schon ihren eigenen Namen in
+// PORTAL_CONFIG/ADAPTERS, damit du sie später (sobald du die reale
+// Struktur kennst) einzeln durch eine eigene Extraktionsfunktion
+// ersetzen kannst, ohne PORTAL_CONFIG oder den Router anfassen zu
+// müssen. Ehrlich gekennzeichnet über adapterUsed-Suffix ":generic".
+function makeNamedGenericAdapter(name) {
+  return function namedAdapter(html, baseUrl) {
+    return { ...genericHtmlAdapter(html, baseUrl), adapterUsed: `${name}:generic` };
+  };
+}
+
 const ADAPTERS = {
   vergabeMuenchen: vergabeMuenchenAdapter,
   genericHtml: genericHtmlAdapter,
   loginSessionPortal: loginSessionPortalAdapter,
+  evergabeOnline: makeNamedGenericAdapter("evergabeOnline"),
+  deutscheEvergabe: makeNamedGenericAdapter("deutscheEvergabe"),
+  berlinVergabe: makeNamedGenericAdapter("berlinVergabe"),
+  brandenburgVergabe: makeNamedGenericAdapter("brandenburgVergabe"),
+  sachsenVergabe: makeNamedGenericAdapter("sachsenVergabe"),
+  sachsenAnhaltVergabe: makeNamedGenericAdapter("sachsenAnhaltVergabe"),
+  bayernVergabe: makeNamedGenericAdapter("bayernVergabe"),
+  dtvp: makeNamedGenericAdapter("dtvp"),
+  subreport: makeNamedGenericAdapter("subreport"),
+  bremenVergabe: makeNamedGenericAdapter("bremenVergabe"),
+  hadHessen: makeNamedGenericAdapter("hadHessen"),
 };
 
 // Portal Adapter Router (Teil C) – reine Objekt-Lookup-Dispatch, KEIN
@@ -524,7 +564,10 @@ function processItem(item, index, staticData) {
     authRequired: false,
     sessionRequired: false,
     browserRequired: false,
+    mfaRequired: false, // wird von diesem Core-Node nie auf true gesetzt (keine Login-Versuche hier) – reserviert für einen späteren Login/Browser-Automation-Baustein, siehe Punkt L
     rateLimited: false,
+    downloadResolverRequired: false,
+    downloadResolverMetadata: null,
     documentsFound: 0,
     documentUrls: [],
     documentNames: [],
@@ -569,6 +612,34 @@ function processItem(item, index, staticData) {
   out.portalAccessStatus = classification.portalAccessStatus;
   out.portalAccessReason = classification.portalAccessReason;
   out.contentType = classification.contentType || null;
+
+  // --- SESSION_REQUIRED-Handshake (Teil 10/3) ---
+  // Erste Anfrage OHNE Session, Antwort ist eine normale (nicht Login-,
+  // nicht Bot-Challenge-) HTML-Seite, ABER der Server hat gerade erst ein
+  // technisches Session-Cookie gesetzt: viele Portale liefern die echten
+  // Downloadlinks erst, wenn dieses Cookie im NÄCHSTEN Request mitgeschickt
+  // wird. Statt die Seite jetzt (ohne Cookie) nach Links zu durchsuchen,
+  // wird EIN sofortiger erneuter Abruf über denselben Retry-Loop-Mechanismus
+  // erzwungen (backoffMs=0 – kein Warten nötig, nur ein neuer Request mit
+  // Cookie). Beim zweiten Durchlauf ist hadValidSession=true, dieser Zweig
+  // greift dann nicht mehr erneut.
+  const gotFreshCookieThisRequest = Object.keys(freshCookies).length > 0;
+  if (
+    classification.portalAccessStatus === "PUBLIC_HTML_WITH_DOWNLOADS" &&
+    !hadValidSession &&
+    gotFreshCookieThisRequest &&
+    !json.isDocumentSubFetch &&
+    retryCountIn < MAX_RETRY_COUNT
+  ) {
+    out.portalAccessStatus = "SESSION_REQUIRED";
+    out.portalAccessReason = "SESSION_COOKIE_JUST_ISSUED_RETRYING_WITH_COOKIE";
+    out.sessionRequired = true;
+    out.needsRetry = true;
+    out.backoffMs = 0;
+    out.retryCount = retryCountIn + 1;
+    out.manualReviewRequired = false;
+    return { json: out, pairedItem: { item: index } };
+  }
 
   out.authRequired = classification.portalAccessStatus === "AUTH_REQUIRED";
   out.loginRequired = out.authRequired;
@@ -626,13 +697,18 @@ function processItem(item, index, staticData) {
       return { json: out, pairedItem: { item: index } };
     }
 
+    if (adapterResult.downloadResolverRequired) {
+      out.downloadResolverRequired = true;
+      out.downloadResolverMetadata = adapterResult.downloadResolverMetadata || null;
+    }
+
     const docUrls = adapterResult.documentUrls || [];
     out.documentUrls = docUrls;
     out.documentsFound = docUrls.length;
 
     if (!docUrls.length) {
       out.portalAccessStatus = "MANUAL_REVIEW";
-      out.portalAccessReason = "NO_DOWNLOAD_LINKS_FOUND_IN_HTML";
+      out.portalAccessReason = out.downloadResolverRequired ? "DOWNLOAD_RESOLVER_REQUIRED_NO_DIRECT_LINK" : "NO_DOWNLOAD_LINKS_FOUND_IN_HTML";
       out.manualReviewRequired = true;
     }
     // WICHTIG: Das eigentliche Herunterladen jedes Eintrags in `documentUrls`

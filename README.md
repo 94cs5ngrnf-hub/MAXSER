@@ -16,18 +16,20 @@ Workflow einfügst.
 - [`docs/architecture.md`](docs/architecture.md) – Zielarchitektur, Node-Reihenfolge
   (behalten/löschen/neu), Klassifizierung, alle Strategien (Session, Login,
   MFA, Browser, Retry, Binärdaten, Claude-Übergabe, Fehlermeldungen).
-- [`n8n/core/portal-access-core.js`](n8n/core/portal-access-core.js) – **Portal Access Core**:
-  Universal Response Classifier, Portal Adapter Router, Datei-Erkennung
-  (Content-Type + Magic Bytes), URL-Resolver, Fehlerhandler, Retry/Backoff,
-  Cookie-Jar/Session-Reuse. Läuft als **ein** Code-Node in einem eigenen
-  Sub-Workflow "MAXSER – Portal Access Core", der per `Execute Workflow`
-  aus dem Hauptworkflow aufgerufen wird.
-- [`n8n/core/auth-browser-orchestrator.js`](n8n/core/auth-browser-orchestrator.js) –
-  Login/Session-/MFA-/Browser-Strategie für AUTH_REQUIRED und
-  BROWSER_REQUIRED Portale.
-- [`n8n/core/document-gate-and-normalization.js`](n8n/core/document-gate-and-normalization.js) –
-  Binärdaten-Handling, Vollständigkeits-Gate vor der Claude-Analyse,
-  `documentAccessStatus` OK/PRÜFEN.
+- [`n8n/core/portal-access-core.js`](n8n/core/portal-access-core.js) – **Universal Classifier +
+  Adapter Router**: Datei-Erkennung (Content-Type + Magic Bytes), URL-Resolver,
+  Fehlerhandler, Retry-Berechnung, Cookie-Parsing/Session-Reuse, Portal-Adapter-
+  Registry. Macht KEINE eigenen HTTP-Requests – läuft direkt nach einem
+  normalen `HTTP Request`-Node (zweimal im Sub-Workflow eingesetzt: nach der
+  Sondierung und nach jedem Einzeldokument-Download).
+- [`n8n/core/prepare-request.js`](n8n/core/prepare-request.js) – setzt
+  `requestUrl`/`_tenderKey`/Startwerte vor der ersten Sondierung.
+- [`n8n/core/add-doc-index.js`](n8n/core/add-doc-index.js) – vergibt
+  eindeutige `docIndex`-Werte nach `Split Out`, vor `Loop Over Items`.
+- [`n8n/core/document-aggregation-and-gate.js`](n8n/core/document-aggregation-and-gate.js) –
+  fasst die Einzeldokument-Downloads aus der Loop-Over-Items-Schleife wieder
+  zu einem Ausschreibungs-Item zusammen und setzt `documentAccessStatus`
+  OK/PRÜFEN (Pre-AI-Gate).
 - [`n8n/core/telegram-error-messages.js`](n8n/core/telegram-error-messages.js) –
   Alle Telegram-Fehler-/Statusmeldungen an einer Stelle.
 - [`n8n/adapters/portal-config.md`](n8n/adapters/portal-config.md) – Zentrale
