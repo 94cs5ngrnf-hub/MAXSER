@@ -1,12 +1,19 @@
 /**
- * MAXSER – Portal Access Core (Revision 3 – ohne $helpers, reine Klassifizierung)
- * ==================================================================================
- * WICHTIG: Dieser Node macht KEINE eigenen HTTP-Requests mehr und ruft
- * NICHT $helpers.httpRequest / $helpers.prepareBinaryData auf (diese APIs
- * sind je nach n8n-Version/Instanz nicht sicher verfügbar). Er läuft
- * IMMER DIREKT NACH einem normalen "HTTP Request"-Node im selben
- * Workflow und klassifiziert nur dessen Ergebnis. Alle Netzwerk-Calls
- * übernehmen echte HTTP-Request-Nodes.
+ * MAXSER – Portal Access Core (Revision 4 – reine Klassifizierung, kein Netzwerk-$helpers)
+ * ============================================================================================
+ * WICHTIG: Dieser Node macht KEINE eigenen HTTP-Requests und ruft NICHT
+ * $helpers.httpRequest / $helpers.prepareBinaryData / this.getCredentials
+ * auf (diese APIs sind je nach n8n-Version/Instanz nicht sicher
+ * verfügbar). Er läuft IMMER DIREKT NACH einem normalen "HTTP Request"-Node
+ * im selben Workflow und klassifiziert nur dessen Ergebnis. Alle
+ * Netzwerk-Calls übernehmen echte HTTP-Request-Nodes.
+ *
+ * EINZIGE AUSNAHME, bewusst und feature-detected: Zum Lesen des bereits
+ * vorhandenen Binärdaten-Bodys wird, falls zur Laufzeit vorhanden,
+ * `$helpers.getBinaryDataBuffer()` genutzt (korrekt in JEDEM n8n-Binary-
+ * Data-Modus, auch filesystem/S3) – mit garantiertem Base64-Fallback,
+ * falls diese Methode in deiner Instanz nicht existiert. Siehe
+ * `readBinaryBuffer()` weiter unten für die genaue Begründung.
  *
  * Node-Modus: "Run Once for All Items"
  *
@@ -54,7 +61,8 @@
 // 0. LIMITS
 // =====================================================================
 const MIN_PLAUSIBLE_FILE_BYTES = 16; // 0-Byte-/abgeschnittene Antworten nie als Datei durchwinken
-const MAX_RETRY_COUNT = 3;
+const MAX_RETRY_COUNT = 3; // 408/429/5xx – braucht öfter mal mehrere Versuche
+const MAX_SESSION_HANDSHAKE_RETRIES = 2; // Cookie-Handshake braucht praktisch nie mehr als 1 Versuch
 const INLINE_RETRY_MAX_WAIT_MS = 15000; // > 15s Wartezeit -> nicht mehr automatisch retryen, sondern RATE_LIMITED melden
 
 // =====================================================================
@@ -529,22 +537,58 @@ function classifyResponse({ statusCode, headers, buffer, finalUrl, networkError,
     if (looksLikeBotChallenge(bodyText)) {
       return { portalAccessStatus: "BLOCKED", portalAccessReason: "BOT_CHALLENGE_DETECTED", retryable: false, fileType, contentType, bodyText };
     }
-    if (looksLikeLoginForm(bodyText) && !hadValidSession) {
-      return { portalAccessStatus: "AUTH_REQUIRED", portalAccessReason: "LOGIN_FORM_DETECTED", retryable: false, fileType, contentType, bodyText };
-    }
     if (portalCfg.requiresBrowser || looksLikeSpaShell(bodyText)) {
       return { portalAccessStatus: "BROWSER_REQUIRED", portalAccessReason: "SPA_OR_CONFIG_FLAG", retryable: false, fileType, contentType, bodyText };
     }
-    return { portalAccessStatus: "PUBLIC_HTML_WITH_DOWNLOADS", portalAccessReason: "HTML_PAGE_OK", retryable: false, fileType, contentType, bodyText };
+    // Login-Formular NICHT sofort als AUTH_REQUIRED werten: manche Portale
+    // zeigen ein optionales "Bieter-Login" (z.B. Sidebar/Header) auf einer
+    // ansonsten öffentlichen Seite mit echten Downloadlinks. Ob wirklich
+    // ein Login nötig ist, entscheidet sich erst NACHDEM der Adapter nach
+    // echten Dokumentlinks gesucht hat (siehe processItem: Login-Check nur
+    // wenn Passwortfeld vorhanden UND der Adapter 0 Dokumente fand).
+    const hasLoginForm = looksLikeLoginForm(bodyText) && !hadValidSession;
+    return { portalAccessStatus: "PUBLIC_HTML_WITH_DOWNLOADS", portalAccessReason: "HTML_PAGE_OK", retryable: false, fileType, contentType, bodyText, hasLoginForm };
   }
 
   return { portalAccessStatus: "MANUAL_REVIEW", portalAccessReason: fileType.reason || "UNCLASSIFIABLE_RESPONSE", retryable: false, fileType, contentType };
 }
 
+/**
+ * Liest die Binärdaten des Response-Bodys als Buffer.
+ *
+ * Bevorzugt (falls verfügbar): `$helpers.getBinaryDataBuffer(index, "data")`
+ * – das ist die EINZIGE Methode, die in JEDEM n8n-Binary-Data-Modus korrekt
+ * liest (inline/base64 UND filesystem UND S3, je nach
+ * N8N_DEFAULT_BINARY_DATA_MODE der Instanz). Diese Methode ist aber NICHT
+ * in jeder n8n-Version/Instanz als Code-Node-API garantiert – deshalb wird
+ * sie nur verwendet, wenn sie zur Laufzeit tatsächlich als Funktion
+ * vorhanden ist (Feature Detection, kein Raten).
+ *
+ * Fallback (funktioniert IMMER, in jeder Version): rohes Base64-Feld
+ * `binaryProp.data` dekodieren. Das ist korrekt im n8n-Standardmodus
+ * ("default", inline gespeichert). Läuft deine Instanz mit
+ * N8N_DEFAULT_BINARY_DATA_MODE=filesystem oder =s3, enthält `binaryProp.data`
+ * KEINEN Base64-String mehr, sondern eine interne Referenz-ID – dann liefert
+ * dieser Fallback falsche Bytes. Prüfe im Zweifel einmal mit einem
+ * `console.log(typeof $helpers?.getBinaryDataBuffer)`-Testlauf, ob der
+ * bevorzugte Pfad in deiner Instanz greift.
+ */
+async function readBinaryBuffer(binaryProp, index) {
+  if (!binaryProp) return Buffer.alloc(0);
+  if (typeof $helpers !== "undefined" && $helpers && typeof $helpers.getBinaryDataBuffer === "function") {
+    try {
+      return await $helpers.getBinaryDataBuffer(index, "data");
+    } catch (err) {
+      // fällt durch auf den garantierten Fallback unten
+    }
+  }
+  return Buffer.from(binaryProp.data, "base64");
+}
+
 // =====================================================================
 // 9. HAUPTABLAUF: ein bereits abgeholtes HTTP-Ergebnis klassifizieren
 // =====================================================================
-function processItem(item, index, staticData) {
+async function processItem(item, index, staticData) {
   const json = item.json || {};
   const procurementPortal = json.procurementPortal || "ANDERES_PORTAL";
   const requestUrl = json.requestUrl || json.firstDocumentUrl || json.sourceUrl;
@@ -601,7 +645,7 @@ function processItem(item, index, staticData) {
   const statusCode = json.statusCode ?? null;
   const headers = json.headers || {};
   const binaryProp = (item.binary && item.binary.data) || null;
-  const buffer = binaryProp ? Buffer.from(binaryProp.data, "base64") : Buffer.alloc(0);
+  const buffer = await readBinaryBuffer(binaryProp, index);
 
   const freshCookies = parseSetCookies(headers);
   const mergedCookies = { ...existingCookies, ...freshCookies };
@@ -624,13 +668,21 @@ function processItem(item, index, staticData) {
   // Cookie). Beim zweiten Durchlauf ist hadValidSession=true, dieser Zweig
   // greift dann nicht mehr erneut.
   const gotFreshCookieThisRequest = Object.keys(freshCookies).length > 0;
-  if (
+  const wantsSessionHandshake =
     classification.portalAccessStatus === "PUBLIC_HTML_WITH_DOWNLOADS" &&
     !hadValidSession &&
     gotFreshCookieThisRequest &&
-    !json.isDocumentSubFetch &&
-    retryCountIn < MAX_RETRY_COUNT
-  ) {
+    !json.isDocumentSubFetch;
+
+  if (wantsSessionHandshake) {
+    if (retryCountIn >= MAX_SESSION_HANDSHAKE_RETRIES) {
+      // Cap erreicht: nicht endlos weiter SESSION_REQUIRED zurückgeben,
+      // sondern sauber auf MANUAL_REVIEW gehen statt in eine Schleife zu laufen.
+      out.portalAccessStatus = "MANUAL_REVIEW";
+      out.portalAccessReason = "SESSION_HANDSHAKE_RETRY_LIMIT_REACHED";
+      out.manualReviewRequired = true;
+      return { json: out, pairedItem: { item: index } };
+    }
     out.portalAccessStatus = "SESSION_REQUIRED";
     out.portalAccessReason = "SESSION_COOKIE_JUST_ISSUED_RETRYING_WITH_COOKIE";
     out.sessionRequired = true;
@@ -707,6 +759,19 @@ function processItem(item, index, staticData) {
     out.documentsFound = docUrls.length;
 
     if (!docUrls.length) {
+      // Login-Check erst JETZT, mit dem echten Ergebnis der Dokumentensuche:
+      // nur wenn ein Passwortfeld erkannt wurde UND der Adapter wirklich
+      // NICHTS gefunden hat, gilt die Seite als Login-geschützt. Das
+      // vermeidet False-Positives bei Seiten mit optionalem Bieter-Login
+      // neben öffentlichen Downloads.
+      if (classification.hasLoginForm) {
+        out.portalAccessStatus = "AUTH_REQUIRED";
+        out.portalAccessReason = "LOGIN_FORM_DETECTED_NO_DOCUMENTS_FOUND";
+        out.authRequired = true;
+        out.loginRequired = true;
+        out.manualReviewRequired = false;
+        return { json: out, pairedItem: { item: index } };
+      }
       out.portalAccessStatus = "MANUAL_REVIEW";
       out.portalAccessReason = out.downloadResolverRequired ? "DOWNLOAD_RESOLVER_REQUIRED_NO_DIRECT_LINK" : "NO_DOWNLOAD_LINKS_FOUND_IN_HTML";
       out.manualReviewRequired = true;
@@ -734,6 +799,6 @@ const staticData = $getWorkflowStaticData("global");
 const items = $input.all();
 const results = [];
 for (let i = 0; i < items.length; i++) {
-  results.push(processItem(items[i], i, staticData));
+  results.push(await processItem(items[i], i, staticData));
 }
 return results;
